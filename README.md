@@ -23,143 +23,137 @@ It is designed for developers who maintain many prototype projects, experiments,
 
 ### Project Discovery
 
-Automatically detects Unity projects inside the tool directory.
+Detects Unity projects inside one or more **projects root folders**, e.g. `D:\UnityProjects` and `F:\UnityProjects`. The default is the script folder. Add or remove roots in **Settings**, or pass `-RootPath` for one session.
 
-A folder is considered a Unity project if it contains an `Assets` directory.
+A folder counts as a Unity project if it contains both an `Assets` and a `ProjectSettings` folder.
 
 ---
 
 ### Project Dashboard
 
-Shows an overview of detected projects including:
+A fast, parallel scan grouped by root folder. Each root gets its own totals (projects, scripts, disk usage, cleanup gain), followed by a grand total. A root on a disconnected drive is shown as *folder not found*. For each project it shows:
 
-- project name
-- number of scripts
-- last modified time
-- estimated cleanup size
-- total workspace statistics
+- Unity version (from `ProjectSettings/ProjectVersion.txt`)
+- render pipeline (Built-in / URP / HDRP, from `Packages/manifest.json`)
+- total size and reclaimable cache size
+- script count
+- last edited (the newest file in the project, ignoring caches)
+- whether it is a Git repo
+- whether it is **currently open in Unity**
+
+Scan results are cached for the session. Press `R` to rescan.
 
 ---
 
-### Project Scanning
+### Project Details
 
-Scans all Unity projects and gathers statistics about:
+Pick one project to see:
 
-- scripts
-- project size
-- temporary build folders
-- potential cleanup targets
+- an assets breakdown by type (Textures, Models, Audio, Video, Scenes, Prefabs & Data, Scripts, Shaders...)
+- its 10 largest files
+- its package list, with each package's version and source (registry, git, embedded...)
 
 ---
 
 ### Cleanup Tool
 
-Removes common Unity-generated folders to free disk space:
+Removes Unity-generated folders from the projects you select:
 
 ```txt
-
 Library
 Temp
-Obj
+obj
 Logs
-UserSettings
-
 ```
 
-This can reduce project size dramatically without affecting source assets.
+You can change the list in **Settings**, for example to add `UserSettings` or `Builds`. Projects open in Unity are skipped, and any folder that can't be removed (files in use) is reported.
 
 ---
 
 ### Script Backup
 
-Creates compressed backups of all `Assets/Scripts` folders.
+Backs up code and shaders (`.cs`, `.asmdef`, `.shader`, `.hlsl`, `.compute`, ...) from **all of `Assets`**, keeping the folder structure. You can create one `.7z` per project or a single combined `.7z` (one per root folder).
 
-Backups are stored in:
-
-```txt
-
-ScriptBackups/
-
-```
-
-Each project gets its own timestamped archive.
+Backups are stored in `<output folder>/ScriptBackups/`.
 
 ---
 
-### Final Assets Archive
+### Archive Projects
 
-Creates a final compressed archive containing the `Assets` folders of all projects.
+Creates **one `.7z` archive per project** using LZMA2 solid compression, which compresses much better than ZIP.
 
-The archive structure:
+1. **Select projects** with an arrow-key / space checklist.
+2. **Pick a preset:**
+   - **Restorable project** (`Assets` + `Packages` + `ProjectSettings`): the project can be reopened in Unity
+   - **Assets only**
+   - **Scripts only**
+   - **Custom**: choose any of the project's folders
+3. **Tune the content:**
+   - include or exclude Textures, Models, Audio, Video, Scenes, Fonts, Unity Packages (`.unitypackage`), Prefabs & Data, Scripts, Shaders, Other, `Plugins`/`ThirdParty`, `StreamingAssets` and `Samples`
+   - add extra folders (e.g. `Art`, `Docs`)
+   - add exclude patterns (e.g. `*.blend1`, `Assets/Old/*`)
+   - add include patterns that override exclusions
+
+   `.meta` files always follow their asset, and your choices are remembered.
+4. **Pick a compression level:** Fast / Normal / Max / Ultra.
+5. **Pre-flight check:** the tool shows file counts and sizes, checks free disk space, and refuses projects that are open in Unity.
+6. Every archive is **verified** (`7z t`) and gets a `<archive>.7z.manifest.json` with the Unity version, packages, options used, sizes and SHA256.
+7. **Optional delete.** Only projects whose archive completed cleanly and verified can be deleted. You confirm by typing `DELETE`, and you choose between the **Recycle Bin** and a permanent delete.
+
+The archive layout:
 
 ```txt
-
-Assets/
-ProjectA/
-ProjectB/
-ProjectC/
-
+_Archives/
+  ProjectA_2026-01-01_12-00-00.7z
+    ProjectA/Assets/...
+    ProjectA/Packages/manifest.json
+    ProjectA/ProjectSettings/...
+  ProjectA_2026-01-01_12-00-00.7z.manifest.json
 ```
 
-Certain folders are skipped during archiving to reduce size:
-
-```txt
-
-Plugins
-Extensions
-Samples
-Scenes
-StreamingAssets
-ThirdParty
-
-```
-
-After the archive is created, the tool can optionally delete the original project folders.
+The source files are never touched while archiving.
 
 ---
 
-### Automatic Temp Cleanup
+### Settings
 
-On startup the tool automatically removes leftover temporary folders such as:
+The following are stored in `UnityArchiveTool.settings.json` next to the script:
 
-```txt
-
-TempBackup
-_TempMergedAssets
-
-```
-
-This ensures safe re-runs after interrupted operations.
+- projects root folders (add or remove; type a path or browse)
+- archive output folder (default `_Archives` inside each project's root folder)
+- 7-Zip path (auto-detected by default)
+- compression level
+- cleanup folders
+- the last-used archive options
 
 ---
 
 ## Requirements
 
 - Windows
-- PowerShell 5.1 or PowerShell 7+
-- Unity projects stored inside the same root directory as the script
+- **PowerShell 7+** (`winget install Microsoft.PowerShell`)
+- **7-Zip** (`winget install 7zip.7zip`). It is found automatically via PATH, the registry or Program Files.
 
 ---
 
 ## Usage
 
-Place the script in the directory containing your Unity projects:
+Place the script next to your Unity projects, or point it at any folder:
 
 ```txt
-
 Workspace/
-UnityProjectsArchiveTool.ps1
-ProjectA/
-ProjectB/
-ProjectC/
-
-````
+  UnityProjectsArchiveTool.ps1
+  ProjectA/
+  ProjectB/
+  ProjectC/
+```
 
 Run the script:
 
 ```powershell
-.\UnityProjectsArchiveTool.ps1
-````
+pwsh .\UnityProjectsArchiveTool.ps1
+pwsh .\UnityProjectsArchiveTool.ps1 -RootPath "D:\UnityProjects", "F:\UnityProjects"
+```
 
 ---
 
@@ -167,11 +161,12 @@ Run the script:
 
 ```txt
 1 - Project Dashboard
-2 - Scan Projects
+2 - Project Details
 3 - Cleanup Projects
 4 - Backup Scripts
-5 - Final Assets Archive
-6 - Exit
+5 - Archive Projects (Compress + Verify + Optional Delete)
+6 - Settings
+7 - Exit
 ```
 
 Press **ESC** at any time to exit the tool.
@@ -180,24 +175,32 @@ Press **ESC** at any time to exit the tool.
 
 ## Example Workflow
 
-Typical project maintenance workflow:
-
 ```txt
 1 → View dashboard
 3 → Cleanup projects
 4 → Backup scripts
-5 → Create final archive
+5 → Archive projects (and optionally delete the originals)
 ```
-
-This allows large Unity project collections to be safely archived while preserving essential assets.
 
 ---
 
 ## Safety
 
-The tool avoids modifying or deleting project files unless the user confirms the action.
+- Nothing is deleted without confirmation.
+- Archiving never modifies or deletes source files.
+- Originals can only be deleted after their archive verified, you must type `DELETE`, and the Recycle Bin is offered.
+- Projects open in the Unity editor are detected and skipped.
 
-Deletion operations always require confirmation.
+---
+
+## Testing
+
+`UnityProjectsDummyDataGenerator.ps1` creates fake Unity projects for testing. Each one includes:
+
+- `ProjectSettings` and `Packages/manifest.json`
+- scripts and `.meta` files
+- incompressible "media" files and compressible YAML files
+- a large `Library` cache
 
 ---
 
@@ -207,33 +210,32 @@ Deletion operations always require confirmation.
 UnityProjectsArchiveTool/
 │
 ├─ UnityProjectsArchiveTool.ps1
-├─ README.md
-└─ ScriptBackups/
+├─ UnityProjectsDummyDataGenerator.ps1
+└─ README.md
 ```
 
 ---
 
 ## Possible Future Improvements
 
-| Progress     | Feature                    | Description                                                                     |
-| ------------ | -------------------------- | ------------------------------------------------------------------------------- |
-| ---**------- | Parallel Project Scanning  | Scan multiple Unity projects simultaneously to significantly improve speed.     |
-| *----------- | Asset Deduplication        | Detect identical assets across projects and store only one copy in the archive. |
-| *----------- | Interactive CLI Menu       | Arrow-key navigation with highlighted selections.                               |
-| *----------- | Live Progress Bars         | Real-time progress display when scanning or archiving projects.                 |
-| *----------- | Disk Usage Visualization   | Show graphical or color-coded disk usage statistics.                            |
-| *----------- | Archive Verification       | Verify integrity of created archives after compression.                         |
-| *----------- | Config File Support        | Allow customizing ignored folders and cleanup targets via config file.          |
-| *----------- | Selective Archiving        | Allow users to choose which projects to archive.                                |
-| *----------- | Restore Tool               | Restore archived projects back into full Unity project structure.               |
-| *----------- | Logging System             | Save detailed logs for automation or CI workflows.                              |
-| *----------- | Git Integration            | Detect Git repositories and optionally skip certain folders.                    |
-| *----------- | Asset Statistics           | Show most common asset types across projects.                                   |
-| *----------- | Duplicate Script Detection | Identify identical scripts across projects.                                     |
-| *----------- | Cross-Platform Support     | Improve compatibility with macOS and Linux PowerShell environments.             |
+|   | Status | Feature                    | Description                                                                     |
+|-- | ------ | -------------------------- | ------------------------------------------------------------------------------- |
+|✅| Done   | Parallel Project Scanning  | Projects are scanned in parallel in a single pass.                              |
+|✅| Done   | Interactive CLI Menu       | Arrow-key checklists for projects and content types.                            |
+|✅| Done   | Live Progress Bars         | Scan progress bar and live 7-Zip progress.                                      |
+|✅| Done   | Archive Verification       | Each archive is tested and gets a manifest with a SHA256.                       |
+|✅| Done   | Config File Support        | Root, output, cleanup folders and archive options are saved to a settings file. |
+|✅| Done   | Selective Archiving        | Choose which projects and which content to archive.                             |
+|✅| Done   | Asset Statistics           | Per-project breakdown by asset type and largest files.                          |
+|🎯| Todo   | Restore Tool               | Restore archived projects using the manifest.                                   |
+|🎯| Todo   | Unity Hub Discovery        | Find projects from Unity Hub's project list, wherever they are.                 |
+|🎯| Todo   | Logging System             | Save detailed logs for automation or CI workflows.                              |
+|🎯| Todo   | CLI Parameters             | Non-interactive archive/cleanup runs for scheduled tasks.                       |
+|🎯| Todo   | Asset Deduplication        | Detect identical assets across projects.                                        |
+|🎯| Todo   | Duplicate Script Detection | Identify identical scripts across projects.                                     |
+|🎯| Todo   | Multi-Drive Support        | Allow for selection of mutiple directories across drives                        |
 
 ---
-
 ## License
 
 MIT License
