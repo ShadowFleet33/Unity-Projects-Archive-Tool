@@ -227,13 +227,14 @@ UnityProjectsArchiveTool/
 |✅| Done   | Config File Support        | Root, output, cleanup folders and archive options are saved to a settings file. |
 |✅| Done   | Selective Archiving        | Choose which projects and which content to archive.                             |
 |✅| Done   | Asset Statistics           | Per-project breakdown by asset type and largest files.                          |
+|✅| Done   | Multi-Drive Support        | Allow for selection of mutiple directories across drives                        |
 |🎯| Todo   | Restore Tool               | Restore archived projects using the manifest.                                   |
 |🎯| Todo   | Unity Hub Discovery        | Find projects from Unity Hub's project list, wherever they are.                 |
 |🎯| Todo   | Logging System             | Save detailed logs for automation or CI workflows.                              |
 |🎯| Todo   | CLI Parameters             | Non-interactive archive/cleanup runs for scheduled tasks.                       |
 |🎯| Todo   | Asset Deduplication        | Detect identical assets across projects.                                        |
 |🎯| Todo   | Duplicate Script Detection | Identify identical scripts across projects.                                     |
-|🎯| Todo   | Multi-Drive Support        | Allow for selection of mutiple directories across drives                        |
+
 
 ---
 ## License
