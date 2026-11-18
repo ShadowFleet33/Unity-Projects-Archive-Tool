@@ -902,28 +902,41 @@ function Clear-UnityProjectCache {
     }
 
     [long]$freed = 0
+    [long]$processed = 0
     $failures = 0
+    $activity = "Cleaning Unity projects"
 
-    foreach ($p in $targets) {
+    try {
+        foreach ($p in $targets) {
 
-        Write-Host ""
-        Write-Host "Cleaning project: $($p.Name)" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Cleaning project: $($p.Name)" -ForegroundColor Yellow
 
-        foreach ($entry in $p.CacheBreakdown.GetEnumerator()) {
+            foreach ($entry in $p.CacheBreakdown.GetEnumerator()) {
 
-            $path = Join-Path $p.FullName $entry.Key
-            if (-not (Test-Path -LiteralPath $path)) { continue }
+                $path = Join-Path $p.FullName $entry.Key
+                if (-not (Test-Path -LiteralPath $path)) { continue }
 
-            try {
-                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
-                $freed += $entry.Value
-                Write-Host "  Removed $($entry.Key) ($(Format-Size $entry.Value))" -ForegroundColor DarkYellow
-            }
-            catch {
-                $failures++
-                Write-Host "  FAILED to fully remove $($entry.Key): $($_.Exception.Message)" -ForegroundColor Red
+                $percent = [int][Math]::Min(100, 100 * $processed / [Math]::Max([long]1, [long]$totalCleanup))
+                Write-Progress -Activity $activity -Status "$($p.Name)\$($entry.Key) ($(Format-Size $entry.Value))" -PercentComplete $percent
+
+                try {
+                    Remove-FolderQuietly -Path $path
+                    $freed += $entry.Value
+                    Write-Host "  Removed $($entry.Key) ($(Format-Size $entry.Value))" -ForegroundColor DarkYellow
+                }
+                catch {
+                    $failures++
+                    Write-Host "  FAILED to fully remove $($entry.Key): $($_.Exception.Message)" -ForegroundColor Red
+                }
+
+                $processed += $entry.Value
             }
         }
+    }
+    finally {
+        # Always close the bar, even after Ctrl+C, so it doesn't stick to the screen
+        Write-Progress -Activity $activity -Completed
     }
 
     Clear-ProjectCache
@@ -1125,12 +1138,22 @@ function Write-ArchiveManifest {
     $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$ArchivePath.manifest.json" -Encoding utf8
 }
 
+function Remove-FolderQuietly {
+    # Remove-Item in PowerShell 7.4+ shows its own "Removed X of Y files" progress bar,
+    # which the console host can leave stuck on screen after it finishes. Hide it here
+    # (local scope only - the tool's own progress bars are unaffected).
+    param([string]$Path)
+
+    $ProgressPreference = "SilentlyContinue"
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
 function Remove-ProjectFolder {
 
     param([string]$Path, [switch]$Permanent)
 
     if ($Permanent) {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        Remove-FolderQuietly -Path $Path
     }
     else {
         Add-Type -AssemblyName Microsoft.VisualBasic
@@ -1818,7 +1841,7 @@ function Initialize-ScriptEnvironment {
         foreach ($path in $leftovers) {
             if (Test-Path -LiteralPath $path) {
                 Write-Host "Removing leftover temp folder: $path" -ForegroundColor DarkYellow
-                try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop }
+                try { Remove-FolderQuietly -Path $path }
                 catch { Write-Host "Failed to remove $path : $_" -ForegroundColor Red }
             }
         }
