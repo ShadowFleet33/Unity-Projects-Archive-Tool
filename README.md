@@ -55,6 +55,19 @@ Pick one project to see:
 
 ---
 
+### Duplicate Assets
+
+Finds identical files across your projects (in all root folders), for example the same asset-store pack imported into five prototypes. It's read-only, so nothing on disk is changed.
+
+- shows the wasted space overall, by content type and by project
+- lists the largest duplicates, how many copies each has, and which projects they are in
+- `D` shows every copy of one file, `E` exports the full report as CSV and JSON
+- files smaller than the minimum size (default 1 MB, change it with `M` or in Settings), `.meta` files and cache folders are skipped
+
+It's fast because only files of the same size are read, and they are compared by a quick partial hash before a full SHA256.
+
+---
+
 ### Cleanup Tool
 
 Removes Unity-generated folders from the projects you select:
@@ -96,6 +109,7 @@ Creates **one `.7z` archive per project** using LZMA2 solid compression, which c
 
    `.meta` files always follow their asset, and your choices are remembered.
 4. **Pick a compression level:** Fast / Normal / Max / Ultra.
+   Optionally turn on the **shared asset pool** (`S`), described below.
 5. **Pre-flight check:** the tool shows file counts and sizes, checks free disk space, and refuses projects that are open in Unity.
 6. Every archive is **verified** (`7z t`) and gets a `<archive>.7z.manifest.json` with the Unity version, packages, options used, sizes and SHA256.
 7. **Optional delete.** Only projects whose archive completed cleanly and verified can be deleted. You confirm by typing `DELETE`, and you choose between the **Recycle Bin** and a permanent delete.
@@ -113,6 +127,25 @@ _Archives/
 
 The source files are never touched while archiving.
 
+#### Shared asset pool (optional)
+
+When you archive several projects from the same root together, files that appear in more than one of them can be stored **once**, in a `_SharedAssets_<date>.7z` next to the project archives:
+
+```txt
+_Archives/
+  _SharedAssets_2026-01-01_12-00-00.7z                 (one copy of each shared file)
+  _SharedAssets_2026-01-01_12-00-00.7z.manifest.json   (files + which archives use them)
+  ProjectA_2026-01-01_12-00-01.7z                      (everything else, incl. the shared files' .meta)
+  ProjectA_2026-01-01_12-00-01.7z.manifest.json        (SharedPool: which files to take from the pool)
+```
+
+- Each project's manifest lists every pooled file (`Path`, `PoolPath`, `SHA256`), so the project can be fully restored from its archive plus the pool.
+- The pool is created and verified first. If it fails, the projects are archived self-contained instead.
+- A pooled project can only be deleted when both its archive and its pool verified.
+- **Keep the pool with its archives:** without it, the pooled files can't be restored.
+
+The option is off by default and is remembered.
+
 ---
 
 ### Settings
@@ -124,7 +157,8 @@ The following are stored in `UnityArchiveTool.settings.json` next to the script:
 - 7-Zip path (auto-detected by default)
 - compression level
 - cleanup folders
-- the last-used archive options
+- the minimum file size for duplicate detection
+- the last-used archive options (including the shared pool)
 
 ---
 
@@ -165,8 +199,9 @@ pwsh .\UnityProjectsArchiveTool.ps1 -RootPath "D:\UnityProjects", "F:\UnityProje
 3 - Cleanup Projects
 4 - Backup Scripts
 5 - Archive Projects (Compress + Verify + Optional Delete)
-6 - Settings
-7 - Exit
+6 - Duplicate Assets
+7 - Settings
+8 - Exit
 ```
 
 Press **ESC** at any time to exit the tool.
@@ -177,6 +212,7 @@ Press **ESC** at any time to exit the tool.
 
 ```txt
 1 → View dashboard
+6 → Find duplicate assets
 3 → Cleanup projects
 4 → Backup scripts
 5 → Archive projects (and optionally delete the originals)
@@ -200,6 +236,7 @@ Press **ESC** at any time to exit the tool.
 - `ProjectSettings` and `Packages/manifest.json`
 - scripts and `.meta` files
 - incompressible "media" files and compressible YAML files
+- two identical files in `Assets/Shared` in every project (to test duplicate detection and the shared pool)
 - a large `Library` cache
 
 ---
@@ -228,11 +265,11 @@ UnityProjectsArchiveTool/
 |✅| Done   | Selective Archiving        | Choose which projects and which content to archive.                             |
 |✅| Done   | Asset Statistics           | Per-project breakdown by asset type and largest files.                          |
 |✅| Done   | Multi-Drive Support        | Allow for selection of mutiple directories across drives                        |
-|🎯| Todo   | Restore Tool               | Restore archived projects using the manifest.                                   |
+|✅| Done   | Asset Deduplication        | Duplicate Assets report and an optional shared asset pool when archiving.       |
+|🎯| Todo   | Restore Tool               | Restore archived projects using the manifest (including shared pool files).     |
 |🎯| Todo   | Unity Hub Discovery        | Find projects from Unity Hub's project list, wherever they are.                 |
 |🎯| Todo   | Logging System             | Save detailed logs for automation or CI workflows.                              |
 |🎯| Todo   | CLI Parameters             | Non-interactive archive/cleanup runs for scheduled tasks.                       |
-|🎯| Todo   | Asset Deduplication        | Detect identical assets across projects.                                        |
 |🎯| Todo   | Duplicate Script Detection | Identify identical scripts across projects.                                     |
 
 

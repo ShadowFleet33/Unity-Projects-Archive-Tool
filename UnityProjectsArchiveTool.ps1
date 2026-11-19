@@ -11,7 +11,7 @@ param(
 Set-StrictMode -Version Latest
 
 $scriptDir = $PSScriptRoot
-$ScriptVersion = @(0, 5, 0)
+$ScriptVersion = @(0, 6, 0)
 $ConfigPath = Join-Path $scriptDir "UnityArchiveTool.settings.json"
 
 # ------------------------------------------------------------
@@ -64,6 +64,8 @@ $CompressionLevels = @(
 $script:ProjectCache = $null
 $script:ProjectCacheTime = $null
 $script:SevenZip = $null
+# File hashes for duplicate detection: "path|length|mtimeTicks" -> @{ Quick; Full }
+$script:HashCache = @{}
 
 # ============================================================
 # Config
@@ -82,6 +84,10 @@ function Get-DefaultConfig {
             ExtraFolders    = @()
             ExcludePatterns = @()
             IncludePatterns = @()
+            SharedPool      = $false   # store files shared by several projects once, in _SharedAssets_*.7z
+        }
+        Dedup            = [ordered]@{
+            MinBytes = 1MB             # smaller files are ignored by duplicate detection
         }
     }
 }
@@ -95,8 +101,8 @@ function Import-ToolConfig {
             $loaded = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json -AsHashtable
 
             foreach ($key in @($loaded.Keys)) {
-                if ($key -eq "Archive" -and $loaded[$key] -is [System.Collections.IDictionary]) {
-                    foreach ($subKey in @($loaded[$key].Keys)) { $cfg.Archive[$subKey] = $loaded[$key][$subKey] }
+                if ($key -in @("Archive", "Dedup") -and $loaded[$key] -is [System.Collections.IDictionary]) {
+                    foreach ($subKey in @($loaded[$key].Keys)) { $cfg[$key][$subKey] = $loaded[$key][$subKey] }
                 }
                 elseif ($key -eq "RootPath" -and $loaded[$key] -and -not (@($loaded.Keys) -contains "RootPaths")) {
                     # Settings from v0.4.0 had a single root
@@ -1107,9 +1113,233 @@ function Get-PresetRoots {
     return , @($unique)
 }
 
+# ============================================================
+# Duplicate detection
+# ============================================================
+function ConvertTo-HexString {
+    param([byte[]]$Bytes)
+    return [BitConverter]::ToString($Bytes).Replace("-", "")
+}
+
+function Get-QuickHash {
+    # SHA256 of the first and last 64 KB: cheap way to tell same-size files apart before a full hash
+    param([string]$Path, [long]$Length)
+
+    $chunk = 64KB
+    $buffer = [byte[]]::new($chunk)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.FileStream]::new($Path, "Open", "Read", "ReadWrite", 4096)
+
+    try {
+        $read = $stream.Read($buffer, 0, $chunk)
+        [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+
+        if ($Length -gt 2 * $chunk) {
+            [void]$stream.Seek(-$chunk, "End")
+            $read = $stream.Read($buffer, 0, $chunk)
+            [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+        }
+
+        [void]$sha.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        return ConvertTo-HexString $sha.Hash
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
+function Get-DedupCandidates {
+    # Files of the given projects that can be compared: everything except caches, VCS/IDE
+    # folders and .meta files, at least MinBytes in size.
+    param([object[]]$Infos, [long]$MinBytes)
+
+    $options = [System.IO.EnumerationOptions]::new()
+    $options.RecurseSubdirectories = $true
+    $options.IgnoreInaccessible = $true
+    $options.AttributesToSkip = [System.IO.FileAttributes]::ReparsePoint
+
+    $skip = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @($Config.CleanupFolders) + @(".git", ".vs", ".idea", ".vscode")) { [void]$skip.Add($name) }
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($p in $Infos) {
+
+        $prefix = $p.FullName.TrimEnd("\").Length + 1
+
+        try { $dirs = @([System.IO.DirectoryInfo]::new($p.FullName).EnumerateDirectories()) }
+        catch { continue }
+
+        foreach ($dir in $dirs) {
+
+            if ($skip.Contains($dir.Name)) { continue }
+            if ($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+
+            foreach ($file in $dir.EnumerateFiles("*", $options)) {
+                if ($file.Length -lt $MinBytes) { continue }
+                if ($file.Name.EndsWith(".meta", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+
+                $candidates.Add([PSCustomObject]@{
+                        Project     = $p.Name
+                        ProjectPath = $p.FullName
+                        Root        = $p.Root
+                        FullName    = $file.FullName
+                        Relative    = $file.FullName.Substring($prefix)
+                        Length      = $file.Length
+                    })
+            }
+        }
+    }
+
+    return , $candidates
+}
+
+function Find-DuplicateFiles {
+    # Groups identical files (2+ copies). Candidates need FullName, Length and ProjectPath.
+    # Stage 1: same size. Stage 2: same quick hash. Stage 3: same full SHA256 (parallel).
+    param([object[]]$Candidates, [long]$MinBytes = 1MB)
+
+    $activity = "Finding duplicate assets"
+
+    # --- Stage 1: only sizes that occur more than once can be duplicates ---
+    $bySize = @{}
+    foreach ($c in $Candidates) {
+        if ($c.Length -lt $MinBytes) { continue }
+        if ($c.FullName.EndsWith(".meta", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $list = $bySize[$c.Length]
+        if ($null -eq $list) { $list = [System.Collections.Generic.List[object]]::new(); $bySize[$c.Length] = $list }
+        $list.Add($c)
+    }
+
+    $sameSize = [System.Collections.Generic.List[object]]::new()
+    foreach ($list in $bySize.Values) { if ($list.Count -ge 2) { $sameSize.AddRange($list) } }
+    if ($sameSize.Count -eq 0) { return , @() }
+
+    $entries = @{}   # FullName -> cache entry
+
+    try {
+        # --- Stage 2: quick hash (cached per path + size + modified time) ---
+        $done = 0
+        foreach ($c in $sameSize) {
+
+            $done++
+            if ($done % 25 -eq 1) {
+                Write-Progress -Activity $activity -Status "Comparing same-size files: $done of $($sameSize.Count)" `
+                    -PercentComplete ([int](50 * $done / $sameSize.Count))
+            }
+
+            try {
+                $key = "{0}|{1}|{2}" -f $c.FullName, $c.Length, [System.IO.File]::GetLastWriteTimeUtc($c.FullName).Ticks
+                $entry = $script:HashCache[$key]
+                if ($null -eq $entry) {
+                    $entry = @{ Quick = (Get-QuickHash -Path $c.FullName -Length $c.Length); Full = $null }
+                    $script:HashCache[$key] = $entry
+                }
+                $entries[$c.FullName] = $entry
+            }
+            catch { }   # unreadable file: never treated as a duplicate
+        }
+
+        $byQuick = @{}
+        foreach ($c in $sameSize) {
+            $entry = $entries[$c.FullName]
+            if ($null -eq $entry) { continue }
+            $groupKey = "$($c.Length)|$($entry.Quick)"
+            $list = $byQuick[$groupKey]
+            if ($null -eq $list) { $list = [System.Collections.Generic.List[object]]::new(); $byQuick[$groupKey] = $list }
+            $list.Add($c)
+        }
+
+        $suspects = [System.Collections.Generic.List[object]]::new()
+        foreach ($list in $byQuick.Values) { if ($list.Count -ge 2) { $suspects.AddRange($list) } }
+
+        # --- Stage 3: full SHA256 of files that still look identical ---
+        $toHash = @($suspects | Where-Object { $null -eq $entries[$_.FullName].Full } | ForEach-Object { $_.FullName } | Select-Object -Unique)
+
+        if ($toHash.Count -gt 0) {
+
+            $job = $toHash | ForEach-Object -AsJob -ThrottleLimit 4 -Parallel {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                    $stream = [System.IO.FileStream]::new($_, "Open", "Read", "ReadWrite", 1MB)
+                    try { $hash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace("-", "") }
+                    finally { $stream.Dispose() }
+                    [PSCustomObject]@{ Path = $_; Hash = $hash }
+                }
+                catch { [PSCustomObject]@{ Path = $_; Hash = $null } }
+                finally { $sha.Dispose() }
+            }
+
+            try {
+                while ($job.State -in @("NotStarted", "Running")) {
+                    $finished = @($job.ChildJobs | Where-Object { $_.State -in @("Completed", "Failed", "Stopped") }).Count
+                    Write-Progress -Activity $activity -Status "Hashing possible duplicates: $finished of $($toHash.Count)" `
+                        -PercentComplete ([int](50 + 50 * $finished / $toHash.Count))
+                    Start-Sleep -Milliseconds 150
+                }
+                foreach ($r in @(Receive-Job -Job $job -Wait)) {
+                    if ($r.Hash) { $entries[$r.Path].Full = $r.Hash }
+                }
+            }
+            finally {
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    finally {
+        Write-Progress -Activity $activity -Completed
+    }
+
+    # --- Build groups ---
+    $byHash = @{}
+    foreach ($c in $suspects) {
+        $full = $entries[$c.FullName].Full
+        if (-not $full) { continue }
+        $groupKey = "$($c.Length)|$full"
+        $list = $byHash[$groupKey]
+        if ($null -eq $list) { $list = [System.Collections.Generic.List[object]]::new(); $byHash[$groupKey] = $list }
+        $list.Add($c)
+    }
+
+    $groups = foreach ($groupKey in $byHash.Keys) {
+
+        $files = $byHash[$groupKey]
+        if ($files.Count -lt 2) { continue }
+
+        $first = $files[0]
+        $category = $ExtensionCategory[[System.IO.Path]::GetExtension($first.FullName)]
+        if (-not $category) { $category = "Other" }
+
+        [PSCustomObject]@{
+            SHA256       = $groupKey.Substring($groupKey.IndexOf("|") + 1)
+            Name         = [System.IO.Path]::GetFileName($first.FullName)
+            Length       = [long]$first.Length
+            Category     = $category
+            Copies       = $files.Count
+            Wasted       = [long]$first.Length * ($files.Count - 1)
+            ProjectCount = @($files | ForEach-Object { $_.ProjectPath } | Select-Object -Unique).Count
+            Files        = @($files)
+        }
+    }
+
+    return , @($groups | Sort-Object Wasted -Descending)
+}
+
 function Write-ArchiveManifest {
 
     param($Info, [System.Collections.IDictionary]$Settings, [string]$PresetKey, [string[]]$Roots, $Result, [string]$ArchivePath)
+
+    # Files stored once in a shared pool archive instead of this archive (restore copies them back)
+    $sharedPool = $null
+    if ($Result.Pool -and $Result.Pooled.Count -gt 0) {
+        $sharedPool = [ordered]@{
+            Archive = Split-Path $Result.Pool.Archive -Leaf
+            SHA256  = $Result.Pool.SHA256
+            Note    = "Files listed here are not in this archive. Extract PoolPath from the pool archive to Path (both relative to the projects root)."
+            Files   = @($Result.Pooled)
+        }
+    }
 
     $manifest = [ordered]@{
         Tool             = "Unity Projects Archive Tool $($ScriptVersion -join '.')"
@@ -1133,9 +1363,190 @@ function Write-ArchiveManifest {
         CompressionRatio = [Math]::Round($Result.ArchiveBytes / [Math]::Max([long]1, [long]$Result.InputBytes), 4)
         SHA256           = $Result.SHA256
         Verified         = $Result.Verified
+        PooledBytes      = $Result.PooledBytes
+        SharedPool       = $sharedPool
     }
 
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$ArchivePath.manifest.json" -Encoding utf8
+    $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$ArchivePath.manifest.json" -Encoding utf8
+}
+
+function Write-PoolManifest {
+
+    param($Pool, [object[]]$Results)
+
+    $manifest = [ordered]@{
+        Tool         = "Unity Projects Archive Tool $($ScriptVersion -join '.')"
+        Created      = (Get-Date).ToString("o")
+        Type         = "SharedAssetPool"
+        Root         = $Pool.Root
+        Note         = "Shared files used by the project archives in UsedBy. Keep this file together with them."
+        Format       = "7z (LZMA2, solid)"
+        FileCount    = $Pool.Files.Count
+        InputBytes   = $Pool.InputBytes
+        SavedBytes   = $Pool.SavedBytes
+        ArchiveFile  = Split-Path $Pool.Archive -Leaf
+        ArchiveBytes = $Pool.ArchiveBytes
+        SHA256       = $Pool.SHA256
+        Verified     = $Pool.Verified
+        UsedBy       = @($Results | Where-Object { $_.Pool -eq $Pool -and $_.Status -ne "Failed" } | ForEach-Object { Split-Path $_.Archive -Leaf })
+        Files        = @($Pool.Entries)
+    }
+
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$($Pool.Archive).manifest.json" -Encoding utf8
+}
+
+function New-VerifiedArchive {
+    # Compresses files (paths relative to WorkingDirectory) into a new .7z, then tests and hashes it.
+    # Returns Status (OK / Warning / Failed), Verified, ArchiveBytes, SHA256.
+    param([string]$WorkingDirectory, [string]$ArchivePath, [string[]]$Files)
+
+    $state = [PSCustomObject]@{ Status = "Failed"; Verified = $false; ArchiveBytes = [long]0; SHA256 = $null }
+    $listPath = Join-Path (Split-Path $ArchivePath -Parent) ".$([System.IO.Path]::GetFileNameWithoutExtension($ArchivePath)).filelist.tmp"
+
+    try {
+        [System.IO.File]::WriteAllLines($listPath, $Files, [System.Text.UTF8Encoding]::new($false))
+
+        $exitCode = Invoke-SevenZip -WorkingDirectory $WorkingDirectory -Arguments @(
+            "a", "-t7z", $ArchivePath, "@$listPath",
+            "-m0=lzma2", "-mx=$($Config.CompressionLevel)", "-mmt=on", "-ms=on", "-mqs=on",
+            "-scsUTF-8", "-ssw", "-bso0", "-bsp1")
+
+        if ($exitCode -ge 2 -or -not (Test-Path -LiteralPath $ArchivePath)) {
+            Write-Host "7-Zip failed (exit code $exitCode)." -ForegroundColor Red
+            if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue }
+            return $state
+        }
+
+        $state.Status = if ($exitCode -eq 1) { "Warning" } else { "OK" }
+        if ($exitCode -eq 1) {
+            Write-Host "7-Zip reported warnings: some files could not be read and may be missing from the archive." -ForegroundColor DarkYellow
+        }
+
+        Write-Host "Verifying archive..." -ForegroundColor DarkCyan
+        $testCode = Invoke-SevenZip -WorkingDirectory $WorkingDirectory -Arguments @("t", $ArchivePath, "-bso0", "-bsp1")
+        $state.Verified = ($testCode -eq 0)
+        if (-not $state.Verified) { Write-Host "Archive verification FAILED (exit code $testCode)." -ForegroundColor Red }
+
+        $state.ArchiveBytes = (Get-Item -LiteralPath $ArchivePath).Length
+        Write-Host "Hashing archive..." -ForegroundColor DarkCyan
+        $state.SHA256 = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash
+
+        return $state
+    }
+    finally {
+        if (Test-Path -LiteralPath $listPath) { Remove-Item -LiteralPath $listPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-UniqueArchivePath {
+    # <dir>\<name>_<stamp>.7z, with a numeric suffix if it already exists (never overwrite or update)
+    param([string]$Directory, [string]$Name)
+
+    $stamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+    $baseName = "$($Name)_$stamp"
+    $suffix = 1
+    while (Test-Path -LiteralPath (Join-Path $Directory "$baseName.7z")) { $suffix++; $baseName = "$($Name)_$($stamp)_$suffix" }
+    return (Join-Path $Directory "$baseName.7z")
+}
+
+function New-SharedPools {
+    # Finds files that occur more than once across the archive jobs of each root, moves them out of
+    # the jobs' file lists and returns one pool per root (stored once in _SharedAssets_*.7z).
+    param([object[]]$Jobs)
+
+    $pools = [System.Collections.Generic.List[object]]::new()
+    $minBytes = [long]$Config.Dedup.MinBytes
+
+    foreach ($rootGroup in ($Jobs | Group-Object { $_.Info.Root })) {
+
+        $rootJobs = @($rootGroup.Group)
+        if ($rootJobs.Count -lt 2) { continue }
+
+        # Archive paths are relative to the projects' parent folder, which is the same for one root
+        $workingDir = [System.IO.Path]::GetDirectoryName($rootJobs[0].Info.FullName)
+
+        $candidates = [System.Collections.Generic.List[object]]::new()
+        foreach ($job in $rootJobs) {
+            foreach ($rel in $job.List.Files) {
+                if ($rel.EndsWith(".meta", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                $file = [System.IO.FileInfo]::new((Join-Path $workingDir $rel))
+                if (-not $file.Exists -or $file.Length -lt $minBytes) { continue }
+                $candidates.Add([PSCustomObject]@{
+                        Job         = $job
+                        Project     = $job.Info.Name
+                        ProjectPath = $job.Info.FullName
+                        FullName    = $file.FullName
+                        Relative    = $rel
+                        Length      = $file.Length
+                    })
+            }
+        }
+
+        Write-Host "Looking for shared files in $($rootGroup.Name)..." -ForegroundColor DarkCyan
+        $groups = Find-DuplicateFiles -Candidates @($candidates) -MinBytes $minBytes
+        if ($groups.Count -eq 0) { continue }
+
+        $pool = [PSCustomObject]@{
+            Project      = "[Shared pool] $($rootGroup.Name)"
+            Root         = $rootGroup.Name
+            WorkingDir   = $workingDir
+            OutputDir    = $rootJobs[0].OutputDir
+            Archive      = $null
+            Files        = [System.Collections.Generic.List[string]]::new()
+            Entries      = [System.Collections.Generic.List[object]]::new()
+            InputBytes   = [long]0
+            SavedBytes   = [long]0
+            Status       = "Failed"
+            Verified     = $false
+            ArchiveBytes = [long]0
+            SHA256       = $null
+            Pool         = $null
+            Pooled       = @()
+            PooledBytes  = [long]0
+        }
+
+        foreach ($g in $groups) {
+            $poolPath = $g.Files[0].Relative
+            $pool.Files.Add($poolPath)
+            $pool.Entries.Add([ordered]@{ PoolPath = $poolPath; SHA256 = $g.SHA256; Size = $g.Length })
+            $pool.InputBytes += $g.Length
+            $pool.SavedBytes += $g.Wasted
+
+            foreach ($f in $g.Files) {
+                $f.Job.Pooled.Add([ordered]@{ Path = $f.Relative; PoolPath = $poolPath; SHA256 = $g.SHA256; Size = $g.Length })
+                $f.Job.PooledBytes += $g.Length
+                $f.Job.Pool = $pool
+            }
+        }
+
+        # Take the pooled files out of each project's list (their .meta files stay with the project)
+        foreach ($job in $rootJobs) {
+            if ($job.Pooled.Count -eq 0) { continue }
+            $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $job.Pooled) { [void]$set.Add($entry.Path) }
+            $job.List = [PSCustomObject]@{
+                Files = [System.Collections.Generic.List[string]]@($job.FullList.Files | Where-Object { -not $set.Contains($_) })
+                Bytes = $job.FullList.Bytes - $job.PooledBytes
+            }
+        }
+
+        $pools.Add($pool)
+    }
+
+    return , $pools
+}
+
+function Undo-SharedPool {
+    # Pool failed: its projects go back to self-contained archives
+    param($Pool, [object[]]$Jobs)
+
+    foreach ($job in $Jobs) {
+        if ($job.Pool -ne $Pool) { continue }
+        $job.List = $job.FullList
+        $job.Pooled.Clear()
+        $job.PooledBytes = [long]0
+        $job.Pool = $null
+    }
 }
 
 function Remove-FolderQuietly {
@@ -1275,6 +1686,8 @@ function New-ProjectArchive {
         Write-Host "Exclude patterns : $(ConvertTo-ListText $settings.ExcludePatterns)" -ForegroundColor White
         Write-Host "Include patterns : $(ConvertTo-ListText $settings.IncludePatterns)  (always included)" -ForegroundColor White
         Write-Host "Compression      : 7z LZMA2 solid, $(Get-LevelName)" -ForegroundColor White
+        $poolText = if ($settings.SharedPool) { "On - files of $(Format-Size $Config.Dedup.MinBytes)+ found in several selected projects are stored once in _SharedAssets_*.7z" } else { "Off - every archive is self-contained" }
+        Write-Host "Shared pool      : $poolText" -ForegroundColor White
         Write-Host "Output folder    : $(Get-OutputDirText)" -ForegroundColor White
         Write-Host ""
         Write-Host "Enter - Start archiving" -ForegroundColor Green
@@ -1284,6 +1697,7 @@ function New-ProjectArchive {
         Write-Host "X     - Exclude patterns (e.g. *.blend1, *.tmp, Assets/Old/*)" -ForegroundColor Cyan
         Write-Host "I     - Include patterns (override exclusions, e.g. *.psd)" -ForegroundColor Cyan
         Write-Host "L     - Compression level" -ForegroundColor Cyan
+        Write-Host "S     - Shared asset pool on/off (store duplicate files once; archives then depend on the pool)" -ForegroundColor Cyan
         Write-Host "Esc   - Cancel" -ForegroundColor DarkGray
 
         Clear-KeyBuffer
@@ -1296,6 +1710,7 @@ function New-ProjectArchive {
             "X" { Write-Host ""; $settings.ExcludePatterns = Read-ListInput "Exclude patterns" $settings.ExcludePatterns }
             "I" { Write-Host ""; $settings.IncludePatterns = Read-ListInput "Include patterns" $settings.IncludePatterns }
             "L" { Select-CompressionLevel }
+            "S" { $settings.SharedPool = -not [bool]$settings.SharedPool }
             "Escape" { Save-ToolConfig; return }
         }
 
@@ -1333,7 +1748,15 @@ function New-ProjectArchive {
             continue
         }
 
-        $jobs.Add([PSCustomObject]@{ Info = $p; List = $list; OutputDir = (Get-OutputDir -Root $p.Root) })
+        $jobs.Add([PSCustomObject]@{
+                Info        = $p
+                List        = $list            # what goes into this project's archive
+                FullList    = $list            # everything selected (List minus pooled files = List)
+                OutputDir   = (Get-OutputDir -Root $p.Root)
+                Pool        = $null
+                Pooled      = [System.Collections.Generic.List[object]]::new()
+                PooledBytes = [long]0
+            })
     }
 
     if ($jobs.Count -eq 0) {
@@ -1354,23 +1777,44 @@ function New-ProjectArchive {
         }
     }
 
+    # Shared asset pool: files found in several projects of the same root are stored once
+    $pools = [System.Collections.Generic.List[object]]::new()
+    if ($settings.SharedPool) {
+        if ($jobs.Count -lt 2) {
+            Write-Host "Shared pool is on, but it needs 2+ projects from the same root - archiving normally." -ForegroundColor DarkGray
+        }
+        else {
+            $pools = New-SharedPools -Jobs @($jobs)
+            if ($pools.Count -eq 0) { Write-Host "No shared files found - every archive will be self-contained." -ForegroundColor DarkGray }
+        }
+    }
+
     Write-Host ""
     $jobs | Format-Table -AutoSize -Property `
     @{ Name = "Project"; Expression = { $_.Info.Name } },
     @{ Name = "Files"; Expression = { $_.List.Files.Count }; Alignment = "Right" },
     @{ Name = "To compress"; Expression = { Format-Size $_.List.Bytes }; Alignment = "Right" },
+    @{ Name = "In pool"; Expression = { if ($_.Pooled.Count) { "$($_.Pooled.Count) files, $(Format-Size $_.PooledBytes)" } else { "-" } }; Alignment = "Right" },
     @{ Name = "On disk"; Expression = { Format-Size $_.Info.TotalBytes }; Alignment = "Right" },
     @{ Name = "Output"; Expression = { $_.OutputDir } } | Out-Host
 
-    $inputTotal = ($jobs | ForEach-Object { $_.List.Bytes } | Measure-Object -Sum).Sum
+    foreach ($pool in $pools) {
+        Write-Host "Shared pool ($($pool.Root)): $($pool.Files.Count) files, $(Format-Size $pool.InputBytes) stored once - saves $(Format-Size $pool.SavedBytes)" -ForegroundColor Green
+    }
+    if ($pools.Count -gt 0) {
+        Write-Host "Archives that use a pool need its _SharedAssets_*.7z to be restored completely - keep them together." -ForegroundColor DarkYellow
+    }
+
+    $inputTotal = [long](($jobs | ForEach-Object { $_.List.Bytes } | Measure-Object -Sum).Sum) + [long](($pools | Measure-Object InputBytes -Sum).Sum)
     Write-Host "Total to compress: $(Format-Size $inputTotal)" -ForegroundColor Yellow
 
     # Free space per output drive
     $byDrive = @{}
-    foreach ($job in $jobs) {
+    foreach ($job in @($jobs) + @($pools)) {
         try {
+            $bytes = if ($job.PSObject.Properties["List"]) { $job.List.Bytes } else { $job.InputBytes }
             $driveRoot = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $job.OutputDir).ProviderPath)
-            $byDrive[$driveRoot] = [long]$byDrive[$driveRoot] + $job.List.Bytes
+            $byDrive[$driveRoot] = [long]$byDrive[$driveRoot] + $bytes
         }
         catch { }
     }
@@ -1390,20 +1834,45 @@ function New-ProjectArchive {
 
     # --- 5. Compress, verify, manifest ---
     $results = [System.Collections.Generic.List[object]]::new()
+
+    # Pools first: if one fails, its projects fall back to self-contained archives
+    foreach ($pool in $pools) {
+
+        $pool.Archive = Get-UniqueArchivePath -Directory $pool.OutputDir -Name "_SharedAssets"
+
+        Write-Host ""
+        Write-Host "Compressing shared pool for $($pool.Root) ($($pool.Files.Count) files, $(Format-Size $pool.InputBytes))" -ForegroundColor Yellow
+
+        try {
+            $state = New-VerifiedArchive -WorkingDirectory $pool.WorkingDir -ArchivePath $pool.Archive -Files @($pool.Files)
+            $pool.Status = $state.Status
+            $pool.Verified = $state.Verified
+            $pool.ArchiveBytes = $state.ArchiveBytes
+            $pool.SHA256 = $state.SHA256
+        }
+        catch {
+            Write-Host "Error creating the shared pool: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        if ($pool.Status -eq "OK" -and $pool.Verified) {
+            Write-Host "Done: $(Format-Size $pool.ArchiveBytes)" -ForegroundColor Green
+        }
+        else {
+            Write-Host "The shared pool did not complete cleanly - its projects will be archived self-contained instead." -ForegroundColor DarkYellow
+            if ($pool.Archive -and (Test-Path -LiteralPath $pool.Archive)) { Remove-Item -LiteralPath $pool.Archive -Force -ErrorAction SilentlyContinue }
+            Undo-SharedPool -Pool $pool -Jobs @($jobs)
+        }
+    }
+    $pools = @($pools | Where-Object { $_.Status -eq "OK" -and $_.Verified })
+
     $index = 0
 
     foreach ($job in $jobs) {
 
         $index++
         $p = $job.Info
-        $outputDir = $job.OutputDir
-        $stamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-        $baseName = "$($p.Name)_$stamp"
         # Same project name in two roots + shared output folder: never overwrite or update an existing archive
-        $suffix = 1
-        while (Test-Path -LiteralPath (Join-Path $outputDir "$baseName.7z")) { $suffix++; $baseName = "$($p.Name)_$($stamp)_$suffix" }
-        $archivePath = Join-Path $outputDir "$baseName.7z"
-        $listPath = Join-Path $outputDir ".$baseName.filelist.tmp"
+        $archivePath = Get-UniqueArchivePath -Directory $job.OutputDir -Name $p.Name
         $workingDir = [System.IO.Path]::GetDirectoryName($p.FullName)
 
         $result = [PSCustomObject]@{
@@ -1416,40 +1885,23 @@ function New-ProjectArchive {
             InputBytes   = $job.List.Bytes
             ArchiveBytes = [long]0
             SHA256       = $null
+            Pool         = $job.Pool
+            Pooled       = @($job.Pooled)
+            PooledBytes  = $job.PooledBytes
         }
         $results.Add($result)
 
+        $poolNote = if ($job.Pool) { " + $($job.Pooled.Count) files in the shared pool" } else { "" }
         Write-Host ""
-        Write-Host "[$index/$($jobs.Count)] Compressing $($p.Name) ($($job.List.Files.Count) files, $(Format-Size $job.List.Bytes))" -ForegroundColor Yellow
+        Write-Host "[$index/$($jobs.Count)] Compressing $($p.Name) ($($job.List.Files.Count) files, $(Format-Size $job.List.Bytes)$poolNote)" -ForegroundColor Yellow
 
         try {
-            [System.IO.File]::WriteAllLines($listPath, $job.List.Files, [System.Text.UTF8Encoding]::new($false))
-
-            $exitCode = Invoke-SevenZip -WorkingDirectory $workingDir -Arguments @(
-                "a", "-t7z", $archivePath, "@$listPath",
-                "-m0=lzma2", "-mx=$($Config.CompressionLevel)", "-mmt=on", "-ms=on", "-mqs=on",
-                "-scsUTF-8", "-ssw", "-bso0", "-bsp1")
-
-            if ($exitCode -ge 2 -or -not (Test-Path -LiteralPath $archivePath)) {
-                Write-Host "7-Zip failed (exit code $exitCode)." -ForegroundColor Red
-                if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
-                continue
-            }
-
-            $result.Status = if ($exitCode -eq 1) { "Warning" } else { "OK" }
-            if ($exitCode -eq 1) {
-                Write-Host "7-Zip reported warnings: some files could not be read and may be missing from the archive." -ForegroundColor DarkYellow
-            }
-
-            Write-Host "Verifying archive..." -ForegroundColor DarkCyan
-            $testCode = Invoke-SevenZip -WorkingDirectory $workingDir -Arguments @("t", $archivePath, "-bso0", "-bsp1")
-            $result.Verified = ($testCode -eq 0)
-
-            if (-not $result.Verified) { Write-Host "Archive verification FAILED (exit code $testCode)." -ForegroundColor Red }
-
-            $result.ArchiveBytes = (Get-Item -LiteralPath $archivePath).Length
-            Write-Host "Hashing archive..." -ForegroundColor DarkCyan
-            $result.SHA256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+            $state = New-VerifiedArchive -WorkingDirectory $workingDir -ArchivePath $archivePath -Files @($job.List.Files)
+            $result.Status = $state.Status
+            $result.Verified = $state.Verified
+            $result.ArchiveBytes = $state.ArchiveBytes
+            $result.SHA256 = $state.SHA256
+            if ($result.Status -eq "Failed") { continue }
 
             Write-ArchiveManifest -Info $p -Settings $settings -PresetKey $presetKey -Roots $roots -Result $result -ArchivePath $archivePath
 
@@ -1458,9 +1910,11 @@ function New-ProjectArchive {
         catch {
             Write-Host "Error archiving $($p.Name): $($_.Exception.Message)" -ForegroundColor Red
         }
-        finally {
-            if (Test-Path -LiteralPath $listPath) { Remove-Item -LiteralPath $listPath -Force -ErrorAction SilentlyContinue }
-        }
+    }
+
+    foreach ($pool in $pools) {
+        try { Write-PoolManifest -Pool $pool -Results @($results) }
+        catch { Write-Host "Could not write the pool manifest: $($_.Exception.Message)" -ForegroundColor Red }
     }
 
     Clear-ProjectCache
@@ -1468,17 +1922,23 @@ function New-ProjectArchive {
     # --- 6. Summary ---
     Write-Title "ARCHIVE SUMMARY"
 
-    $results | Format-Table -AutoSize -Property Project,
+    @($pools) + @($results) | Format-Table -AutoSize -Property Project,
     @{ Name = "Input"; Expression = { Format-Size $_.InputBytes }; Alignment = "Right" },
     @{ Name = "Archive"; Expression = { if ($_.ArchiveBytes) { Format-Size $_.ArchiveBytes } else { "-" } }; Alignment = "Right" },
     @{ Name = "Ratio"; Expression = { if ($_.ArchiveBytes) { "{0:P0}" -f ($_.ArchiveBytes / [Math]::Max([long]1, [long]$_.InputBytes)) } else { "-" } }; Alignment = "Right" },
+    @{ Name = "In pool"; Expression = { if ($_.PooledBytes) { Format-Size $_.PooledBytes } else { "-" } }; Alignment = "Right" },
     Status,
     @{ Name = "Verified"; Expression = { if ($_.Verified) { "yes" } else { "NO" } } } | Out-Host
 
+    if ($pools.Count -gt 0) {
+        Write-Host "Saved by the shared pool: $(Format-Size (($pools | Measure-Object SavedBytes -Sum).Sum)) of input" -ForegroundColor Green
+    }
     Write-Host "Archives saved to: $($outputDirs -join ', ')" -ForegroundColor Gray
 
-    # --- 7. Optional delete of originals (verified archives only) ---
-    $deletable = @($results | Where-Object { $_.Verified -and $_.Status -eq "OK" })
+    # --- 7. Optional delete of originals (verified archives only; pooled projects also need a verified pool) ---
+    $deletable = @($results | Where-Object {
+            $_.Verified -and $_.Status -eq "OK" -and ($null -eq $_.Pool -or ($_.Pool.Verified -and $_.Pool.Status -eq "OK"))
+        })
 
     if ($deletable.Count -eq 0) {
         Write-Host ""
@@ -1503,6 +1963,12 @@ function New-ProjectArchive {
 
     Write-Host "Projects to delete:" -ForegroundColor Red
     $toDelete | ForEach-Object { Write-Host "  $($_.FullName)" -ForegroundColor Red }
+    $poolArchives = @($results | Where-Object { $_.Pool -and $toDelete -contains $_.Info } | ForEach-Object { $_.Pool.Archive } | Select-Object -Unique)
+    if ($poolArchives.Count -gt 0) {
+        Write-Host ""
+        Write-Host "These archives depend on a shared pool - keep it with them, or they cannot be fully restored:" -ForegroundColor DarkYellow
+        $poolArchives | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkYellow }
+    }
     Write-Host ""
     Write-Host "R - Move to Recycle Bin (space is freed when the bin is emptied)" -ForegroundColor Yellow
     Write-Host "P - Delete permanently" -ForegroundColor Red
@@ -1540,6 +2006,225 @@ function New-ProjectArchive {
     Write-Host ""
     Write-Host "Delete step finished." -ForegroundColor Green
     Wait-ReturnOrExit
+}
+
+# ============================================================
+# Duplicate assets report
+# ============================================================
+function Export-DuplicateReport {
+
+    param([object[]]$Groups, [object[]]$Infos)
+
+    $outputDir = Get-OutputDir -Root (Get-RootPaths)[0]
+    if (-not (Test-Path -LiteralPath $outputDir)) { New-Item -ItemType Directory -Path $outputDir -Force | Out-Null }
+
+    $base = Join-Path $outputDir "DuplicateAssets_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')"
+    $groupId = 0
+
+    $rows = foreach ($g in $Groups) {
+        $groupId++
+        foreach ($f in $g.Files) {
+            [PSCustomObject]@{
+                Group    = $groupId
+                SHA256   = $g.SHA256
+                Category = $g.Category
+                Bytes    = $g.Length
+                Copies   = $g.Copies
+                Project  = $f.Project
+                Root     = $f.Root
+                Path     = $f.FullName
+            }
+        }
+    }
+    @($rows) | Export-Csv -LiteralPath "$base.csv" -Encoding utf8
+
+    $groupId = 0
+    [ordered]@{
+        Tool         = "Unity Projects Archive Tool $($ScriptVersion -join '.')"
+        Created      = (Get-Date).ToString("o")
+        MinBytes     = $Config.Dedup.MinBytes
+        Projects     = @($Infos | ForEach-Object { $_.FullName })
+        WastedBytes  = [long](($Groups | Measure-Object Wasted -Sum).Sum)
+        Groups       = @(foreach ($g in $Groups) {
+                $groupId++
+                [ordered]@{
+                    Group    = $groupId
+                    SHA256   = $g.SHA256
+                    Name     = $g.Name
+                    Category = $g.Category
+                    Bytes    = $g.Length
+                    Copies   = $g.Copies
+                    Wasted   = $g.Wasted
+                    Files    = @($g.Files | ForEach-Object { $_.FullName })
+                }
+            })
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$base.json" -Encoding utf8
+
+    return $base
+}
+
+function Show-DuplicateAssets {
+
+    Write-Title "DUPLICATE ASSETS"
+
+    $infos = Get-ProjectInfos
+    if ($infos.Count -eq 0) {
+        Write-Host "No Unity projects found in: $((Get-RootPaths) -join ', ')" -ForegroundColor Red
+        Wait-ReturnOrExit
+        return
+    }
+
+    $selected = Select-Projects -Infos $infos -Title "Select projects to compare (duplicates are searched across all of them)" -Preselect { param($p) $true }
+    if ($null -eq $selected -or $selected.Count -eq 0) { return }
+
+    $groups = $null
+    $candidateCount = 0
+    $multiRoot = @($selected | ForEach-Object { $_.Root } | Select-Object -Unique).Count -gt 1
+
+    while ($true) {
+
+        $minBytes = [long]$Config.Dedup.MinBytes
+
+        if ($null -eq $groups) {
+            Clear-Host
+            Write-Title "DUPLICATE ASSETS"
+            Write-Host "Listing files of $($selected.Count) project(s) (files of $(Format-Size $minBytes) or more)..." -ForegroundColor DarkCyan
+            $candidates = Get-DedupCandidates -Infos $selected -MinBytes $minBytes
+            $candidateCount = $candidates.Count
+            $groups = Find-DuplicateFiles -Candidates $candidates -MinBytes $minBytes
+        }
+
+        Clear-Host
+        Write-Title "DUPLICATE ASSETS"
+
+        $wasted = [long](($groups | Measure-Object Wasted -Sum).Sum)
+        $extraCopies = [long](($groups | ForEach-Object { $_.Copies - 1 } | Measure-Object -Sum).Sum)
+
+        Write-Host "Projects compared : $($selected.Count)" -ForegroundColor White
+        Write-Host "Files compared    : $candidateCount (of $(Format-Size $minBytes) or more, .meta files and caches ignored)" -ForegroundColor White
+        Write-Host "Duplicate groups  : $($groups.Count)  ($extraCopies extra copies)" -ForegroundColor White
+        Write-Host "Wasted space      : $(Format-Size $wasted)" -ForegroundColor Yellow
+
+        if ($groups.Count -gt 0) {
+
+            Write-Host ""
+            Write-Host "By content type:" -ForegroundColor Cyan
+            $groups | Group-Object Category | ForEach-Object {
+                [PSCustomObject]@{
+                    Category = $_.Name
+                    Groups   = $_.Count
+                    Wasted   = [long](($_.Group | Measure-Object Wasted -Sum).Sum)
+                }
+            } | Sort-Object Wasted -Descending | Format-Table -AutoSize -Property Category,
+            @{ Name = "Groups"; Expression = { $_.Groups }; Alignment = "Right" },
+            @{ Name = "Wasted"; Expression = { Format-Size $_.Wasted }; Alignment = "Right" } | Out-Host
+
+            # Per project: how much of its content also exists elsewhere
+            Write-Host "By project (content that has an identical copy elsewhere):" -ForegroundColor Cyan
+            $perProject = @{}
+            foreach ($g in $groups) {
+                foreach ($f in $g.Files) {
+                    $row = $perProject[$f.ProjectPath]
+                    if ($null -eq $row) {
+                        $row = [PSCustomObject]@{ Project = $f.Project; Root = $f.Root; Files = 0; Bytes = [long]0 }
+                        $perProject[$f.ProjectPath] = $row
+                    }
+                    $row.Files++
+                    $row.Bytes += $g.Length
+                }
+            }
+            $projectColumns = @("Project",
+                @{ Name = "Files"; Expression = { $_.Files }; Alignment = "Right" },
+                @{ Name = "Shared size"; Expression = { Format-Size $_.Bytes }; Alignment = "Right" })
+            if ($multiRoot) { $projectColumns += "Root" }
+            $perProject.Values | Sort-Object Bytes -Descending | Format-Table -AutoSize -Property $projectColumns | Out-Host
+
+            $top = 20
+            Write-Host "Largest duplicates (top $([Math]::Min($top, $groups.Count)) of $($groups.Count)):" -ForegroundColor Cyan
+            $groups | Select-Object -First $top | Format-Table -AutoSize -Property `
+            @{ Name = "File"; Expression = { if ($_.Name.Length -gt 40) { $_.Name.Substring(0, 37) + "..." } else { $_.Name } } },
+            @{ Name = "Size"; Expression = { Format-Size $_.Length }; Alignment = "Right" },
+            @{ Name = "Copies"; Expression = { $_.Copies }; Alignment = "Right" },
+            @{ Name = "Wasted"; Expression = { Format-Size $_.Wasted }; Alignment = "Right" },
+            @{ Name = "Projects"; Expression = {
+                    if ($_.ProjectCount -eq 1) { "$($_.Files[0].Project) (same project)" }
+                    else {
+                        $names = @($_.Files | ForEach-Object { $_.Project } | Select-Object -Unique)
+                        $text = $names -join ", "
+                        if ($text.Length -gt 50) { $text = $text.Substring(0, 47) + "..." }
+                        $text
+                    }
+                }
+            } | Out-Host
+
+            Write-Host "Tip: Archive Projects > S (Shared asset pool) stores these files once when the projects are archived together." -ForegroundColor DarkGray
+        }
+
+        Write-Host ""
+        if ($groups.Count -gt 0) {
+            Write-Host "D - Show every copy of one duplicate" -ForegroundColor Cyan
+            Write-Host "E - Export the full report (CSV + JSON)" -ForegroundColor Cyan
+        }
+        Write-Host "M - Minimum file size (now $(Format-Size $minBytes))" -ForegroundColor Cyan
+        Write-Host "R - Rescan" -ForegroundColor Cyan
+        Write-Host "Enter / Esc - Back to menu" -ForegroundColor DarkGray
+
+        Clear-KeyBuffer
+        $key = Read-KeyPress
+
+        switch ($key.Key) {
+
+            "D" {
+                if ($groups.Count -eq 0) { break }
+                $items = foreach ($g in $groups) {
+                    @{ Label = "{0,-40} {1,10}  x{2}  {3}" -f $g.Name, (Format-Size $g.Length), $g.Copies, $g.Category }
+                }
+                $pick = Read-Checklist -Title "Pick a duplicate to inspect" -Items @($items) -Single
+                if ($null -eq $pick) { break }
+
+                $g = $groups[$pick[0]]
+                Clear-Host
+                Write-Title "DUPLICATE: $($g.Name)"
+                Write-Host "Size   : $(Format-Size $g.Length)   Copies: $($g.Copies)   Wasted: $(Format-Size $g.Wasted)" -ForegroundColor White
+                Write-Host "SHA256 : $($g.SHA256)" -ForegroundColor DarkGray
+                Write-Host ""
+                foreach ($f in $g.Files) { Write-Host "  $($f.FullName)" -ForegroundColor Gray }
+                Write-Host ""
+                Write-Host "Press any key to go back..." -ForegroundColor DarkGray
+                Clear-KeyBuffer
+                [void](Read-KeyPress)
+            }
+
+            "E" {
+                if ($groups.Count -eq 0) { break }
+                try {
+                    $base = Export-DuplicateReport -Groups $groups -Infos $selected
+                    Write-Host ""
+                    Write-Host "Saved: $base.csv" -ForegroundColor Green
+                    Write-Host "       $base.json" -ForegroundColor Green
+                }
+                catch { Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red }
+                Wait-ReturnOrExit
+            }
+
+            "M" {
+                Write-Host ""
+                $text = (Read-Host "Minimum file size in MB (e.g. 0.5, 1, 10)").Trim()
+                $mb = 0.0
+                if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$mb) -and $mb -gt 0) {
+                    $Config.Dedup.MinBytes = [long]($mb * 1MB)
+                    Save-ToolConfig
+                    $groups = $null
+                }
+                elseif ($text) { Write-Host "Not a valid size." -ForegroundColor Red; Start-Sleep -Seconds 2 }
+            }
+
+            "R" { $groups = $null }
+
+            "Enter" { return }
+            "Escape" { return }
+        }
+    }
 }
 
 # ============================================================
@@ -1772,7 +2457,8 @@ function Show-Settings {
         Write-Host "3 - 7-Zip path           : $sevenZipText" -ForegroundColor Cyan
         Write-Host "4 - Compression level    : $(Get-LevelName)" -ForegroundColor Cyan
         Write-Host "5 - Cleanup folders      : $(ConvertTo-ListText $Config.CleanupFolders)" -ForegroundColor Cyan
-        Write-Host "6 - Back" -ForegroundColor DarkGray
+        Write-Host "6 - Duplicate min size   : $(Format-Size $Config.Dedup.MinBytes)  (Duplicate Assets + shared pool)" -ForegroundColor Cyan
+        Write-Host "7 - Back" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "Settings file: $ConfigPath" -ForegroundColor DarkGray
 
@@ -1817,7 +2503,18 @@ function Show-Settings {
                 }
             }
 
-            "6" { return }
+            "6" {
+                Write-Host ""
+                $text = (Read-Host "Minimum file size for duplicate detection in MB (e.g. 0.5, 1, 10)").Trim()
+                $mb = 0.0
+                if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$mb) -and $mb -gt 0) {
+                    $Config.Dedup.MinBytes = [long]($mb * 1MB)
+                    Save-ToolConfig
+                }
+                elseif ($text) { Write-Host "Not a valid size." -ForegroundColor Red; Start-Sleep -Seconds 2 }
+            }
+
+            "7" { return }
         }
     }
 }
@@ -1933,10 +2630,11 @@ while ($true) {
     Write-Host "3 - Cleanup Projects" -ForegroundColor Yellow
     Write-Host "4 - Backup Scripts" -ForegroundColor Green
     Write-Host "5 - Archive Projects (Compress + Verify + Optional Delete)" -ForegroundColor DarkYellow
-    Write-Host "6 - Settings" -ForegroundColor Gray
-    Write-Host "7 - Exit" -ForegroundColor Red
+    Write-Host "6 - Duplicate Assets" -ForegroundColor Magenta
+    Write-Host "7 - Settings" -ForegroundColor Gray
+    Write-Host "8 - Exit" -ForegroundColor Red
     Write-Host ""
-    Write-Host "Select an option (1-7) or press ESC to exit: " -ForegroundColor Gray
+    Write-Host "Select an option (1-8) or press ESC to exit: " -ForegroundColor Gray
 
     Clear-KeyBuffer
     $key = Read-KeyPress
@@ -1951,7 +2649,8 @@ while ($true) {
         "3" { Clear-UnityProjectCache }
         "4" { Backup-UnityScripts }
         "5" { New-ProjectArchive }
-        "6" { Show-Settings }
-        "7" { Exit-Tool }
+        "6" { Show-DuplicateAssets }
+        "7" { Show-Settings }
+        "8" { Exit-Tool }
     }
 }

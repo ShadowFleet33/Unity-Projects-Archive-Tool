@@ -134,6 +134,12 @@ function Set-TestProjects {
 
     if ($maxGB -lt $minGB) { $maxGB = $minGB }
 
+    # Identical "asset store" files copied into every project, so duplicate detection
+    # and the shared asset pool have something to find. Fixed seed = same bytes every run.
+    $rng = [System.Random]::new(1234)
+    $sharedAssets = [ordered]@{ "SharedRock.png" = [byte[]]::new(2MB); "SharedTheme.ogg" = [byte[]]::new(1.5MB) }
+    foreach ($name in @($sharedAssets.Keys)) { $rng.NextBytes($sharedAssets[$name]) }
+
     $created = 0
     $index = 1
 
@@ -168,7 +174,7 @@ function Set-TestProjects {
         @{ dependencies = $deps } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $packagesPath "manifest.json") -Encoding utf8
 
         # Realistic Assets structure
-        $folders = @("Scripts", "Materials", "Textures", "Audio", "Video", "Scenes", "Prefabs", "Plugins")
+        $folders = @("Scripts", "Materials", "Textures", "Audio", "Video", "Scenes", "Prefabs", "Plugins", "Shared")
         foreach ($folder in $folders) { New-AssetFolder (Join-Path $assetsPath $folder) }
 
         $projectSizeBytes = [int64]((Get-Random -Minimum $minGB -Maximum ($maxGB + 0.0001)) * 1GB)
@@ -202,6 +208,13 @@ function Set-TestProjects {
             $size = [int64]($assetsSize * $asset.Share)
             if ($asset.Kind -eq "Random") { New-RandomFile $filePath $size } else { New-TextFile $filePath $size }
             New-MetaFile $filePath
+        }
+
+        # Duplicates shared by all generated projects (each project gets its own .meta GUID)
+        foreach ($name in $sharedAssets.Keys) {
+            $sharedPath = Join-Path $assetsPath "Shared\$name"
+            [System.IO.File]::WriteAllBytes($sharedPath, $sharedAssets[$name])
+            New-MetaFile $sharedPath
         }
 
         # Loose file at the Assets root (older tool versions dropped these)
