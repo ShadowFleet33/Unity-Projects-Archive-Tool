@@ -64,7 +64,15 @@ Finds identical files across your projects (in all root folders), for example th
 - `D` shows every copy of one file, `E` exports the full report as CSV and JSON
 - files smaller than the minimum size (default 1 MB, change it with `M` or in Settings), `.meta` files and cache folders are skipped
 
-It's fast because only files of the same size are read, and they are compared by a quick partial hash before a full SHA256.
+#### How it stays fast (even on a slow hard drive)
+
+- **Only possible duplicates are read.** A file is only read if another file has exactly the same size. Large files (16 MB and up) are first compared by their first and last 64 KB.
+- **Saved hashes.** Every SHA256 is saved in `<root>\.uat\hashes.tsv` (a hidden folder). A file is read again only when its size or modified time changes. Paths are stored relative to the root, so the cache still works if an external drive gets another letter. The second search on 70 GB of unchanged projects reads nothing.
+- **Recognised copies** (Settings, on by default). A file with the same name, size and modified time (to 1/10,000,000 s) as an already-hashed file is treated as a copy of it, and isn't read. Windows keeps the modified time when you copy a file, so textures copied into a new project are recognised instantly.
+- **Drive-aware reading.** Hard drives and USB drives are read one file at a time, in folder order; parallel reads make a hard drive seek back and forth. SSDs use 4 threads. You can override the thread count in Settings.
+- **Progress** shows files, GB, read speed and the time left. After a search, a summary line shows how many hashes were saved, how many copies were recognised and how many files were read.
+
+`R` rescans using the saved hashes. `H` reads every file again and refreshes them. **Settings > Duplicate detection** has the minimum size, recognised copies, hash threads, and a button to delete the saved hashes.
 
 ---
 
@@ -157,7 +165,7 @@ The following are stored in `UnityArchiveTool.settings.json` next to the script:
 - 7-Zip path (auto-detected by default)
 - compression level
 - cleanup folders
-- the minimum file size for duplicate detection
+- duplicate detection: minimum file size, recognised copies, hash threads
 - the last-used archive options (including the shared pool)
 
 ---

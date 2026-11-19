@@ -11,7 +11,7 @@ param(
 Set-StrictMode -Version Latest
 
 $scriptDir = $PSScriptRoot
-$ScriptVersion = @(0, 6, 0)
+$ScriptVersion = @(0, 6, 1)
 $ConfigPath = Join-Path $scriptDir "UnityArchiveTool.settings.json"
 
 # ------------------------------------------------------------
@@ -64,8 +64,10 @@ $CompressionLevels = @(
 $script:ProjectCache = $null
 $script:ProjectCacheTime = $null
 $script:SevenZip = $null
-# File hashes for duplicate detection: "path|length|mtimeTicks" -> @{ Quick; Full }
-$script:HashCache = @{}
+# Duplicate detection: persistent hash cache per root, drive types, stats of the last run
+$script:HashStores = @{}
+$script:DriveMediaTypes = @{}
+$script:LastHashStats = $null
 
 # ============================================================
 # Config
@@ -87,7 +89,9 @@ function Get-DefaultConfig {
             SharedPool      = $false   # store files shared by several projects once, in _SharedAssets_*.7z
         }
         Dedup            = [ordered]@{
-            MinBytes = 1MB             # smaller files are ignored by duplicate detection
+            MinBytes    = 1MB          # smaller files are ignored by duplicate detection
+            TrustCopies = $true        # same name + size + modified time as a hashed file = same content (not read)
+            HashThreads = 0            # 0 = auto (1 on hard drives, 4 on SSDs)
         }
     }
 }
@@ -434,7 +438,7 @@ function Get-UnityProjects {
 
     param([string[]]$Roots = (Get-RootPaths))
 
-    $skipNames = @("ScriptBackups", "_Archives", (Split-Path (Get-OutputDir) -Leaf))
+    $skipNames = @("ScriptBackups", "_Archives", ".uat", (Split-Path (Get-OutputDir) -Leaf))
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     $projects = foreach ($root in $Roots) {
@@ -1116,13 +1120,349 @@ function Get-PresetRoots {
 # ============================================================
 # Duplicate detection
 # ============================================================
-function ConvertTo-HexString {
-    param([byte[]]$Bytes)
-    return [BitConverter]::ToString($Bytes).Replace("-", "")
+function Format-Duration {
+    param([double]$Seconds)
+    if ($Seconds -lt 0 -or [double]::IsNaN($Seconds) -or [double]::IsInfinity($Seconds)) { return "?" }
+    $t = [TimeSpan]::FromSeconds([Math]::Ceiling($Seconds))
+    if ($t.TotalHours -ge 1) { return "{0} h {1:00} min" -f [int][Math]::Floor($t.TotalHours), $t.Minutes }
+    if ($t.TotalMinutes -ge 1) { return "{0} min {1:00} s" -f $t.Minutes, $t.Seconds }
+    return "$($t.Seconds) s"
+}
+
+# ------------------------------------------------------------
+# Persistent hash cache: <root>\.uat\hashes.tsv
+# Paths are relative to the root, so the cache still works when an
+# external drive gets another letter. A hash is reused while the file's
+# size and modified time (100 ns ticks) are unchanged.
+# ------------------------------------------------------------
+function Get-HashCachePath {
+    param([string]$Root)
+    return (Join-Path (Join-Path $Root ".uat") "hashes.tsv")
+}
+
+function Get-RootRelativePath {
+    param([string]$Root, [string]$FullName)
+    $prefix = $Root.TrimEnd("\") + "\"
+    if (-not $FullName.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    return $FullName.Substring($prefix.Length)
+}
+
+function Get-HashStore {
+
+    param([string]$Root)
+
+    $store = $script:HashStores[$Root]
+    if ($null -ne $store) { return $store }
+
+    $store = [PSCustomObject]@{
+        Root   = $Root
+        ByPath = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)   # relative path -> "size|ticks|sha256"
+        ByCopy = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)   # "name|size|ticks" -> sha256
+        Dirty  = $false
+    }
+
+    $path = Get-HashCachePath $Root
+    if ([System.IO.File]::Exists($path)) {
+        try {
+            foreach ($line in [System.IO.File]::ReadLines($path)) {
+                if ($line.Length -eq 0 -or $line[0] -eq "#") { continue }
+                $parts = $line.Split("`t")
+                if ($parts.Length -ne 4) { continue }
+                $store.ByPath[$parts[0]] = "$($parts[1])|$($parts[2])|$($parts[3])"
+                $store.ByCopy["$([System.IO.Path]::GetFileName($parts[0]))|$($parts[1])|$($parts[2])"] = $parts[3]
+            }
+        }
+        catch {
+            Write-Host "Hash cache could not be read ($path), it will be rebuilt: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+
+    $script:HashStores[$Root] = $store
+    return $store
+}
+
+function Set-HashEntry {
+    param($Store, [string]$Relative, [long]$Length, [long]$Ticks, [string]$Hash)
+    $Store.ByPath[$Relative] = "$Length|$Ticks|$Hash"
+    $Store.ByCopy["$([System.IO.Path]::GetFileName($Relative))|$Length|$Ticks"] = $Hash
+    $Store.Dirty = $true
+}
+
+function Resolve-KnownHash {
+    # Returns @{ Hash; Kind = "Cache" | "Copy" } or $null when the file has to be read.
+    param($Store, [string]$Relative, [long]$Length, [long]$Ticks)
+
+    $value = $null
+    if ($Store.ByPath.TryGetValue($Relative, [ref]$value)) {
+        $parts = $value.Split("|")
+        if ([long]$parts[0] -eq $Length -and [long]$parts[1] -eq $Ticks) { return @{ Hash = $parts[2]; Kind = "Cache" } }
+    }
+
+    if ($Config.Dedup.TrustCopies) {
+        # A copy keeps its name, size and modified time: reuse the hash of the file it was copied from
+        $copyKey = "$([System.IO.Path]::GetFileName($Relative))|$Length|$Ticks"
+        foreach ($s in @($Store) + @($script:HashStores.Values | Where-Object { $_ -ne $Store })) {
+            $hash = $null
+            if ($s.ByCopy.TryGetValue($copyKey, [ref]$hash)) {
+                Set-HashEntry -Store $Store -Relative $Relative -Length $Length -Ticks $Ticks -Hash $hash
+                return @{ Hash = $hash; Kind = "Copy" }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Save-HashStores {
+
+    foreach ($store in @($script:HashStores.Values)) {
+
+        if (-not $store.Dirty) { continue }
+        if (-not [System.IO.Directory]::Exists($store.Root)) { continue }
+
+        $path = Get-HashCachePath $store.Root
+        $tempPath = "$path.tmp"
+
+        try {
+            $dir = Split-Path $path -Parent
+            if (-not [System.IO.Directory]::Exists($dir)) {
+                $created = New-Item -ItemType Directory -Path $dir -Force
+                $created.Attributes = $created.Attributes -bor [System.IO.FileAttributes]::Hidden
+            }
+
+            # Drop entries of project folders that no longer exist (archived and deleted)
+            $folderExists = @{}
+            $lines = [System.Collections.Generic.List[string]]::new()
+            $lines.Add("# Unity Projects Archive Tool hash cache v1: relativePath<TAB>size<TAB>lastWriteTicksUtc<TAB>sha256")
+
+            foreach ($kv in $store.ByPath.GetEnumerator()) {
+                $top = $kv.Key.Split("\")[0]
+                $exists = $folderExists[$top]
+                if ($null -eq $exists) { $exists = [System.IO.Directory]::Exists((Join-Path $store.Root $top)); $folderExists[$top] = $exists }
+                if (-not $exists) { continue }
+                $parts = $kv.Value.Split("|")
+                $lines.Add("$($kv.Key)`t$($parts[0])`t$($parts[1])`t$($parts[2])")
+            }
+
+            [System.IO.File]::WriteAllLines($tempPath, $lines, [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $tempPath -Destination $path -Force
+            $store.Dirty = $false
+        }
+        catch {
+            Write-Host "Could not save the hash cache in $($store.Root): $($_.Exception.Message)" -ForegroundColor DarkYellow
+            if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Clear-HashCaches {
+    $script:HashStores = @{}
+    foreach ($root in (Get-RootPaths)) {
+        $path = Get-HashCachePath $root
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# ------------------------------------------------------------
+# Hashing engine: compiled once per session. Reads files in 1 MB
+# sequential blocks on N threads and exposes live counters for the
+# progress bar (speed + time left).
+# ------------------------------------------------------------
+function Initialize-Hasher {
+
+    if ("UatHasher" -as [type]) { return }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.IO;
+using System.Security.Cryptography;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class UatHasher
+{
+    private long _bytesDone;
+    private int _filesDone;
+    private volatile string _current = "";
+    private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+
+    // path -> SHA256 hex, or null when the file could not be read
+    public readonly ConcurrentDictionary<string, string> Results = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    public long BytesDone { get { return Interlocked.Read(ref _bytesDone); } }
+    public int FilesDone { get { return Volatile.Read(ref _filesDone); } }
+    public string CurrentFile { get { return _current; } }
+
+    public Task Start(string[] paths, int threads)
+    {
+        var queue = new ConcurrentQueue<string>(paths);
+        var workers = new Task[Math.Max(1, threads)];
+        for (int i = 0; i < workers.Length; i++)
+        {
+            workers[i] = Task.Factory.StartNew(() => Work(queue), TaskCreationOptions.LongRunning);
+        }
+        return Task.WhenAll(workers);
+    }
+
+    public void Cancel() { _cts.Cancel(); }
+
+    private void Work(ConcurrentQueue<string> queue)
+    {
+        var buffer = new byte[1 << 20];
+        string path;
+
+        while (!_cts.IsCancellationRequested && queue.TryDequeue(out path))
+        {
+            _current = path;
+            string hash = null;
+
+            try
+            {
+                using (var sha = SHA256.Create())
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1, FileOptions.SequentialScan))
+                {
+                    int read;
+                    while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        if (_cts.IsCancellationRequested) { return; }
+                        sha.TransformBlock(buffer, 0, read, null, 0);
+                        Interlocked.Add(ref _bytesDone, read);
+                    }
+                    sha.TransformFinalBlock(buffer, 0, 0);
+                    hash = BitConverter.ToString(sha.Hash).Replace("-", "");
+                }
+            }
+            catch
+            {
+                hash = null;
+            }
+
+            Results[path] = hash;
+            Interlocked.Increment(ref _filesDone);
+        }
+    }
+}
+'@
+}
+
+function Get-DriveMediaType {
+    # HDD / SSD / SCM / Unspecified / Unknown for the drive holding Path (cached per drive)
+    param([string]$Path)
+
+    $driveRoot = [System.IO.Path]::GetPathRoot($Path)
+    if (-not $driveRoot) { return "Unknown" }
+    $cached = $script:DriveMediaTypes[$driveRoot]
+    if ($cached) { return $cached }
+
+    $type = "Unknown"
+    $letter = $driveRoot.TrimEnd("\").TrimEnd(":")
+    if ($letter.Length -eq 1) {
+        try {
+            $disk = Get-Partition -DriveLetter $letter -ErrorAction Stop | Get-Disk -ErrorAction Stop
+            $physical = Get-PhysicalDisk -ErrorAction Stop | Where-Object { [string]$_.DeviceId -eq [string]$disk.Number } | Select-Object -First 1
+            if ($physical -and $physical.MediaType) { $type = [string]$physical.MediaType }
+        }
+        catch { }
+    }
+
+    $script:DriveMediaTypes[$driveRoot] = $type
+    return $type
+}
+
+function Get-HashThreads {
+    # Hard drives read fastest one file at a time (parallel reads make the head seek back and forth).
+    # USB and unknown drives are treated as hard drives.
+    param([string]$Path)
+
+    $configured = [int]$Config.Dedup.HashThreads
+    if ($configured -gt 0) { return $configured }
+    if ((Get-DriveMediaType $Path) -in @("SSD", "SCM")) { return 4 }
+    return 1
+}
+
+function Invoke-FileHashing {
+    # Full SHA256 of the given files (objects with FullName + Length), one batch per drive.
+    # Returns a hashtable: FullName -> hash (or $null when unreadable).
+    param([object[]]$Files)
+
+    $results = @{}
+    if ($Files.Count -eq 0) { return $results }
+
+    Initialize-Hasher
+
+    $activity = "Hashing files"
+    $totalFiles = $Files.Count
+    $totalBytes = [long](($Files | Measure-Object Length -Sum).Sum)
+    [long]$bytesBefore = 0
+    $filesBefore = 0
+    $hasher = $null
+
+    # One batch per drive; the drive type (thread count) is detected before the clock starts
+    $batches = foreach ($group in ($Files | Group-Object { [System.IO.Path]::GetPathRoot($_.FullName) })) {
+        Write-Progress -Activity $activity -Status "Checking drive type of $($group.Name)..."
+        [PSCustomObject]@{
+            Threads = Get-HashThreads -Path $group.Name
+            # Path order keeps files of one folder together, which is roughly disk order
+            Paths   = [string[]]@($group.Group | Sort-Object FullName | ForEach-Object { $_.FullName })
+        }
+    }
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $samples = [System.Collections.Generic.Queue[object]]::new()
+
+    try {
+        foreach ($batch in $batches) {
+
+            $threads = $batch.Threads
+            $paths = $batch.Paths
+
+            $hasher = [UatHasher]::new()
+            $task = $hasher.Start($paths, $threads)
+            $finished = $false
+
+            while (-not $finished) {
+
+                $finished = $task.Wait(250)
+
+                $bytes = $bytesBefore + $hasher.BytesDone
+                $elapsed = $clock.Elapsed.TotalSeconds
+                $samples.Enqueue(@($elapsed, $bytes))
+                while ($samples.Count -gt 2 -and ($elapsed - $samples.Peek()[0]) -gt 5) { [void]$samples.Dequeue() }
+
+                # Speed over the last ~5 seconds, so it reacts to the drive but doesn't jump around
+                $oldest = $samples.Peek()
+                $window = $elapsed - $oldest[0]
+                $rate = if ($window -ge 0.5) { ($bytes - $oldest[1]) / $window } elseif ($elapsed -gt 0) { $bytes / $elapsed } else { 0 }
+
+                $eta = if ($rate -gt 0) { Format-Duration (($totalBytes - $bytes) / $rate) } else { "?" }
+                $percent = [int][Math]::Min(100, 100 * $bytes / [Math]::Max([long]1, $totalBytes))
+                $current = [System.IO.Path]::GetFileName($hasher.CurrentFile)
+
+                Write-Progress -Activity $activity `
+                    -Status ("{0:N0} of {1:N0} files - {2} of {3} - {4}/s - {5} left ({6} thread{7})" -f ($filesBefore + $hasher.FilesDone), $totalFiles,
+                    (Format-Size $bytes), (Format-Size $totalBytes), (Format-Size $rate), $eta, $threads, $(if ($threads -gt 1) { "s" } else { "" })) `
+                    -CurrentOperation $current -PercentComplete $percent
+            }
+
+            foreach ($kv in $hasher.Results.GetEnumerator()) { $results[$kv.Key] = $kv.Value }
+            $bytesBefore += $hasher.BytesDone
+            $filesBefore += $hasher.FilesDone
+            $hasher = $null
+        }
+    }
+    finally {
+        if ($null -ne $hasher) { $hasher.Cancel() }   # Ctrl+C: stop the worker threads
+        Write-Progress -Activity $activity -Completed
+    }
+
+    $script:LastHashStats.BytesRead += $bytesBefore
+    $script:LastHashStats.Seconds += $clock.Elapsed.TotalSeconds
+    return $results
 }
 
 function Get-QuickHash {
-    # SHA256 of the first and last 64 KB: cheap way to tell same-size files apart before a full hash
+    # SHA256 of the first and last 64 KB: cheap way to tell large same-size files apart before a full hash
     param([string]$Path, [long]$Length)
 
     $chunk = 64KB
@@ -1141,7 +1481,7 @@ function Get-QuickHash {
         }
 
         [void]$sha.TransformFinalBlock([byte[]]::new(0), 0, 0)
-        return ConvertTo-HexString $sha.Hash
+        return [BitConverter]::ToString($sha.Hash).Replace("-", "")
     }
     finally {
         $stream.Dispose()
@@ -1166,8 +1506,6 @@ function Get-DedupCandidates {
 
     foreach ($p in $Infos) {
 
-        $prefix = $p.FullName.TrimEnd("\").Length + 1
-
         try { $dirs = @([System.IO.DirectoryInfo]::new($p.FullName).EnumerateDirectories()) }
         catch { continue }
 
@@ -1185,8 +1523,8 @@ function Get-DedupCandidates {
                         ProjectPath = $p.FullName
                         Root        = $p.Root
                         FullName    = $file.FullName
-                        Relative    = $file.FullName.Substring($prefix)
                         Length      = $file.Length
+                        Ticks       = $file.LastWriteTimeUtc.Ticks
                     })
             }
         }
@@ -1196,11 +1534,18 @@ function Get-DedupCandidates {
 }
 
 function Find-DuplicateFiles {
-    # Groups identical files (2+ copies). Candidates need FullName, Length and ProjectPath.
-    # Stage 1: same size. Stage 2: same quick hash. Stage 3: same full SHA256 (parallel).
-    param([object[]]$Candidates, [long]$MinBytes = 1MB)
+    # Groups identical files (2+ copies). Candidates need FullName, Length, ProjectPath and Root
+    # (Ticks optional). Stages:
+    #   1. same size only
+    #   2. saved hashes (same path, or a copy: same name + size + modified time); large unknown
+    #      files are compared by a quick head/tail hash first
+    #   3. full SHA256 of what is left (sequential on hard drives), saved for next time
+    param([object[]]$Candidates, [long]$MinBytes = 1MB, [switch]$Rehash)
 
+    $script:LastHashStats = [PSCustomObject]@{ Compared = 0; FromCache = 0; Copies = 0; Read = 0; Unreadable = 0; BytesRead = [long]0; Seconds = 0.0 }
+    $stats = $script:LastHashStats
     $activity = "Finding duplicate assets"
+    $quickMin = 16MB   # below this one sequential read is cheaper than a quick hash + a full read
 
     # --- Stage 1: only sizes that occur more than once can be duplicates ---
     $bySize = @{}
@@ -1214,87 +1559,101 @@ function Find-DuplicateFiles {
 
     $sameSize = [System.Collections.Generic.List[object]]::new()
     foreach ($list in $bySize.Values) { if ($list.Count -ge 2) { $sameSize.AddRange($list) } }
+    $stats.Compared = $sameSize.Count
     if ($sameSize.Count -eq 0) { return , @() }
 
-    $entries = @{}   # FullName -> cache entry
+    $hashes = @{}   # FullName -> SHA256
+    $fileInfo = @{} # FullName -> @{ Store; Relative; Ticks }
+    $unknown = [System.Collections.Generic.List[object]]::new()
 
     try {
-        # --- Stage 2: quick hash (cached per path + size + modified time) ---
+        # --- Stage 2a: hashes we already know ---
         $done = 0
         foreach ($c in $sameSize) {
 
             $done++
-            if ($done % 25 -eq 1) {
-                Write-Progress -Activity $activity -Status "Comparing same-size files: $done of $($sameSize.Count)" `
-                    -PercentComplete ([int](50 * $done / $sameSize.Count))
+            if ($done % 200 -eq 1) {
+                Write-Progress -Activity $activity -Status "Checking saved hashes: $done of $($sameSize.Count)" -PercentComplete ([int](100 * $done / $sameSize.Count))
             }
 
-            try {
-                $key = "{0}|{1}|{2}" -f $c.FullName, $c.Length, [System.IO.File]::GetLastWriteTimeUtc($c.FullName).Ticks
-                $entry = $script:HashCache[$key]
-                if ($null -eq $entry) {
-                    $entry = @{ Quick = (Get-QuickHash -Path $c.FullName -Length $c.Length); Full = $null }
-                    $script:HashCache[$key] = $entry
-                }
-                $entries[$c.FullName] = $entry
+            $ticks = if ($c.PSObject.Properties["Ticks"]) { [long]$c.Ticks } else {
+                try { [System.IO.File]::GetLastWriteTimeUtc($c.FullName).Ticks } catch { continue }
             }
-            catch { }   # unreadable file: never treated as a duplicate
+
+            $store = $null
+            $relative = $null
+            if ($c.Root) {
+                $relative = Get-RootRelativePath -Root $c.Root -FullName $c.FullName
+                if ($relative) { $store = Get-HashStore -Root $c.Root }
+            }
+            $fileInfo[$c.FullName] = @{ Store = $store; Relative = $relative; Ticks = $ticks }
+
+            if ($store -and -not $Rehash) {
+                $known = Resolve-KnownHash -Store $store -Relative $relative -Length $c.Length -Ticks $ticks
+                if ($known) {
+                    $hashes[$c.FullName] = $known.Hash
+                    if ($known.Kind -eq "Copy") { $stats.Copies++ } else { $stats.FromCache++ }
+                    continue
+                }
+            }
+            $unknown.Add($c)
         }
 
-        $byQuick = @{}
-        foreach ($c in $sameSize) {
-            $entry = $entries[$c.FullName]
-            if ($null -eq $entry) { continue }
-            $groupKey = "$($c.Length)|$($entry.Quick)"
-            $list = $byQuick[$groupKey]
-            if ($null -eq $list) { $list = [System.Collections.Generic.List[object]]::new(); $byQuick[$groupKey] = $list }
+        # --- Stage 2b: large unknown files - skip the ones whose head/tail is unique ---
+        $toHash = [System.Collections.Generic.List[object]]::new()
+        $bigBySize = @{}
+        foreach ($c in $unknown) {
+            if ($c.Length -lt $quickMin) { $toHash.Add($c); continue }
+            $list = $bigBySize[$c.Length]
+            if ($null -eq $list) { $list = [System.Collections.Generic.List[object]]::new(); $bigBySize[$c.Length] = $list }
             $list.Add($c)
         }
 
-        $suspects = [System.Collections.Generic.List[object]]::new()
-        foreach ($list in $byQuick.Values) { if ($list.Count -ge 2) { $suspects.AddRange($list) } }
+        foreach ($length in $bigBySize.Keys) {
 
-        # --- Stage 3: full SHA256 of files that still look identical ---
-        $toHash = @($suspects | Where-Object { $null -eq $entries[$_.FullName].Full } | ForEach-Object { $_.FullName } | Select-Object -Unique)
+            $list = $bigBySize[$length]
+            $knownSameSize = @($bySize[$length] | Where-Object { $hashes.ContainsKey($_.FullName) }).Count
 
-        if ($toHash.Count -gt 0) {
-
-            $job = $toHash | ForEach-Object -AsJob -ThrottleLimit 4 -Parallel {
-                $sha = [System.Security.Cryptography.SHA256]::Create()
-                try {
-                    $stream = [System.IO.FileStream]::new($_, "Open", "Read", "ReadWrite", 1MB)
-                    try { $hash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace("-", "") }
-                    finally { $stream.Dispose() }
-                    [PSCustomObject]@{ Path = $_; Hash = $hash }
-                }
-                catch { [PSCustomObject]@{ Path = $_; Hash = $null } }
-                finally { $sha.Dispose() }
+            if ($knownSameSize -gt 0) {
+                # Can't compare a quick hash with a saved full hash: read them fully
+                $toHash.AddRange($list)
+                continue
             }
 
-            try {
-                while ($job.State -in @("NotStarted", "Running")) {
-                    $finished = @($job.ChildJobs | Where-Object { $_.State -in @("Completed", "Failed", "Stopped") }).Count
-                    Write-Progress -Activity $activity -Status "Hashing possible duplicates: $finished of $($toHash.Count)" `
-                        -PercentComplete ([int](50 + 50 * $finished / $toHash.Count))
-                    Start-Sleep -Milliseconds 150
-                }
-                foreach ($r in @(Receive-Job -Job $job -Wait)) {
-                    if ($r.Hash) { $entries[$r.Path].Full = $r.Hash }
-                }
+            $byQuick = @{}
+            foreach ($c in $list) {
+                Write-Progress -Activity $activity -Status "Comparing large files: $([System.IO.Path]::GetFileName($c.FullName))"
+                try { $quick = Get-QuickHash -Path $c.FullName -Length $c.Length } catch { $stats.Unreadable++; continue }
+                $group = $byQuick[$quick]
+                if ($null -eq $group) { $group = [System.Collections.Generic.List[object]]::new(); $byQuick[$quick] = $group }
+                $group.Add($c)
             }
-            finally {
-                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-            }
+            foreach ($group in $byQuick.Values) { if ($group.Count -ge 2) { $toHash.AddRange($group) } }
         }
     }
     finally {
         Write-Progress -Activity $activity -Completed
     }
 
+    # --- Stage 3: full SHA256 ---
+    if ($toHash.Count -gt 0) {
+        $read = Invoke-FileHashing -Files @($toHash)
+        foreach ($c in $toHash) {
+            $hash = $read[$c.FullName]
+            if (-not $hash) { $stats.Unreadable++; continue }
+            $hashes[$c.FullName] = $hash
+            $stats.Read++
+            $info = $fileInfo[$c.FullName]
+            if ($info.Store) { Set-HashEntry -Store $info.Store -Relative $info.Relative -Length $c.Length -Ticks $info.Ticks -Hash $hash }
+        }
+    }
+
+    Save-HashStores
+
     # --- Build groups ---
     $byHash = @{}
-    foreach ($c in $suspects) {
-        $full = $entries[$c.FullName].Full
+    foreach ($c in $sameSize) {
+        $full = $hashes[$c.FullName]
         if (-not $full) { continue }
         $groupKey = "$($c.Length)|$full"
         $list = $byHash[$groupKey]
@@ -1324,6 +1683,17 @@ function Find-DuplicateFiles {
     }
 
     return , @($groups | Sort-Object Wasted -Descending)
+}
+
+function Get-HashStatsText {
+    $s = $script:LastHashStats
+    if ($null -eq $s) { return "" }
+    $text = "Hashes: {0:N0} saved, {1:N0} recognised copies, {2:N0} read" -f $s.FromCache, $s.Copies, $s.Read
+    if ($s.Read -gt 0) {
+        $text += " ($(Format-Size $s.BytesRead) at $(Format-Size ($s.BytesRead / [Math]::Max(0.001, $s.Seconds)))/s, $(Format-Duration $s.Seconds))"
+    }
+    if ($s.Unreadable -gt 0) { $text += ", $($s.Unreadable) unreadable" }
+    return $text
 }
 
 function Write-ArchiveManifest {
@@ -1475,6 +1845,8 @@ function New-SharedPools {
                         Job         = $job
                         Project     = $job.Info.Name
                         ProjectPath = $job.Info.FullName
+                        Root        = $job.Info.Root
+                        Ticks       = $file.LastWriteTimeUtc.Ticks
                         FullName    = $file.FullName
                         Relative    = $rel
                         Length      = $file.Length
@@ -2078,6 +2450,7 @@ function Show-DuplicateAssets {
     if ($null -eq $selected -or $selected.Count -eq 0) { return }
 
     $groups = $null
+    $rehash = $false
     $candidateCount = 0
     $multiRoot = @($selected | ForEach-Object { $_.Root } | Select-Object -Unique).Count -gt 1
 
@@ -2091,7 +2464,8 @@ function Show-DuplicateAssets {
             Write-Host "Listing files of $($selected.Count) project(s) (files of $(Format-Size $minBytes) or more)..." -ForegroundColor DarkCyan
             $candidates = Get-DedupCandidates -Infos $selected -MinBytes $minBytes
             $candidateCount = $candidates.Count
-            $groups = Find-DuplicateFiles -Candidates $candidates -MinBytes $minBytes
+            $groups = Find-DuplicateFiles -Candidates $candidates -MinBytes $minBytes -Rehash:$rehash
+            $rehash = $false
         }
 
         Clear-Host
@@ -2104,6 +2478,7 @@ function Show-DuplicateAssets {
         Write-Host "Files compared    : $candidateCount (of $(Format-Size $minBytes) or more, .meta files and caches ignored)" -ForegroundColor White
         Write-Host "Duplicate groups  : $($groups.Count)  ($extraCopies extra copies)" -ForegroundColor White
         Write-Host "Wasted space      : $(Format-Size $wasted)" -ForegroundColor Yellow
+        Write-Host (Get-HashStatsText) -ForegroundColor DarkGray
 
         if ($groups.Count -gt 0) {
 
@@ -2166,7 +2541,8 @@ function Show-DuplicateAssets {
             Write-Host "E - Export the full report (CSV + JSON)" -ForegroundColor Cyan
         }
         Write-Host "M - Minimum file size (now $(Format-Size $minBytes))" -ForegroundColor Cyan
-        Write-Host "R - Rescan" -ForegroundColor Cyan
+        Write-Host "R - Rescan (uses saved hashes, only new or changed files are read)" -ForegroundColor Cyan
+        Write-Host "H - Full re-hash (read every file again and refresh the saved hashes)" -ForegroundColor Cyan
         Write-Host "Enter / Esc - Back to menu" -ForegroundColor DarkGray
 
         Clear-KeyBuffer
@@ -2220,6 +2596,8 @@ function Show-DuplicateAssets {
             }
 
             "R" { $groups = $null }
+
+            "H" { $groups = $null; $rehash = $true }
 
             "Enter" { return }
             "Escape" { return }
@@ -2439,6 +2817,80 @@ function Edit-RootFolders {
     }
 }
 
+function Get-HashThreadsText {
+    $threads = [int]$Config.Dedup.HashThreads
+    if ($threads -gt 0) { return "$threads" }
+    return "auto"
+}
+
+function Show-DedupSettings {
+
+    while ($true) {
+
+        Clear-Host
+        Write-Title "DUPLICATE DETECTION"
+
+        $cachedEntries = 0
+        foreach ($root in (Get-RootPaths)) {
+            $path = Get-HashCachePath $root
+            if (Test-Path -LiteralPath $path) { $cachedEntries += [Math]::Max(0, @([System.IO.File]::ReadLines($path)).Count - 1) }
+        }
+
+        Write-Host "1 - Minimum file size : $(Format-Size $Config.Dedup.MinBytes)" -ForegroundColor Cyan
+        Write-Host "2 - Trust copies      : $(if ($Config.Dedup.TrustCopies) { 'On' } else { 'Off' })" -ForegroundColor Cyan
+        Write-Host "      A file with the same name, size and modified time (to 1/10,000,000 s) as an already" -ForegroundColor DarkGray
+        Write-Host "      hashed file is a copy of it (Windows keeps the modified time when copying), so it isn't read." -ForegroundColor DarkGray
+        Write-Host "3 - Hash threads      : $(Get-HashThreadsText)" -ForegroundColor Cyan
+        foreach ($root in (Get-RootPaths)) {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+            Write-Host "      $root : $(Get-DriveMediaType $root) drive -> $(Get-HashThreads -Path $root) thread(s)" -ForegroundColor DarkGray
+        }
+        Write-Host "4 - Clear saved hashes ($('{0:N0}' -f $cachedEntries) files in <root>\.uat\hashes.tsv)" -ForegroundColor Cyan
+        Write-Host "5 - Back" -ForegroundColor DarkGray
+
+        Clear-KeyBuffer
+        $key = Read-KeyPress
+        if ($key.Key -eq "Escape") { return }
+
+        switch ($key.KeyChar) {
+
+            "1" {
+                Write-Host ""
+                $text = (Read-Host "Minimum file size in MB (e.g. 0.5, 1, 10)").Trim()
+                $mb = 0.0
+                if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$mb) -and $mb -gt 0) {
+                    $Config.Dedup.MinBytes = [long]($mb * 1MB)
+                    Save-ToolConfig
+                }
+                elseif ($text) { Write-Host "Not a valid size." -ForegroundColor Red; Start-Sleep -Seconds 2 }
+            }
+
+            "2" { $Config.Dedup.TrustCopies = -not [bool]$Config.Dedup.TrustCopies; Save-ToolConfig }
+
+            "3" {
+                $choices = @(0, 1, 2, 4, 8)
+                $items = foreach ($c in $choices) {
+                    @{ Label = $(if ($c -eq 0) { "Auto (1 on hard drives and USB drives, 4 on SSDs)" } else { "$c" }) }
+                }
+                $current = [Math]::Max(0, [Array]::IndexOf($choices, [int]$Config.Dedup.HashThreads))
+                $pick = Read-Checklist -Title "Hash threads" -Items @($items) -Single -Cursor $current
+                if ($null -ne $pick) { $Config.Dedup.HashThreads = $choices[$pick[0]]; Save-ToolConfig }
+            }
+
+            "4" {
+                Write-Host ""
+                if (Read-YesNo "Delete the saved hashes? The next duplicate search reads every file again") {
+                    Clear-HashCaches
+                    Write-Host "Saved hashes deleted." -ForegroundColor Green
+                    Start-Sleep -Seconds 1
+                }
+            }
+
+            "5" { return }
+        }
+    }
+}
+
 function Show-Settings {
 
     while ($true) {
@@ -2457,7 +2909,7 @@ function Show-Settings {
         Write-Host "3 - 7-Zip path           : $sevenZipText" -ForegroundColor Cyan
         Write-Host "4 - Compression level    : $(Get-LevelName)" -ForegroundColor Cyan
         Write-Host "5 - Cleanup folders      : $(ConvertTo-ListText $Config.CleanupFolders)" -ForegroundColor Cyan
-        Write-Host "6 - Duplicate min size   : $(Format-Size $Config.Dedup.MinBytes)  (Duplicate Assets + shared pool)" -ForegroundColor Cyan
+        Write-Host "6 - Duplicate detection  : min $(Format-Size $Config.Dedup.MinBytes), trust copies $(if ($Config.Dedup.TrustCopies) { 'on' } else { 'off' }), threads $(Get-HashThreadsText)" -ForegroundColor Cyan
         Write-Host "7 - Back" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "Settings file: $ConfigPath" -ForegroundColor DarkGray
@@ -2503,16 +2955,7 @@ function Show-Settings {
                 }
             }
 
-            "6" {
-                Write-Host ""
-                $text = (Read-Host "Minimum file size for duplicate detection in MB (e.g. 0.5, 1, 10)").Trim()
-                $mb = 0.0
-                if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$mb) -and $mb -gt 0) {
-                    $Config.Dedup.MinBytes = [long]($mb * 1MB)
-                    Save-ToolConfig
-                }
-                elseif ($text) { Write-Host "Not a valid size." -ForegroundColor Red; Start-Sleep -Seconds 2 }
-            }
+            "6" { Show-DedupSettings }
 
             "7" { return }
         }
@@ -2525,7 +2968,7 @@ function Show-Settings {
 function Initialize-ScriptEnvironment {
 
     # Leftovers from older versions and interrupted runs
-    foreach ($root in Get-RootPaths) {
+    foreach ($root in (Get-RootPaths)) {
 
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
 
@@ -2572,7 +3015,7 @@ function Show-Header {
     Write-Host "Version : $($ScriptVersion -join '.')" -ForegroundColor Cyan
 
     $label = "Root    :"
-    foreach ($root in Get-RootPaths) {
+    foreach ($root in (Get-RootPaths)) {
         if (Test-Path -LiteralPath $root -PathType Container) {
             Write-Host "$label $root  ($((Get-UnityProjects -Roots @($root)).Count) projects)" -ForegroundColor Gray
         }
@@ -2611,7 +3054,7 @@ if ($RootPath) {
 }
 
 # Missing roots (e.g. an unplugged drive) are kept and shown as NOT FOUND
-if (-not @(Get-RootPaths | Where-Object { Test-Path -LiteralPath $_ -PathType Container })) {
+if (-not @((Get-RootPaths) | Where-Object { Test-Path -LiteralPath $_ -PathType Container })) {
     Write-Host "None of the root folders exist: $((Get-RootPaths) -join ', ')" -ForegroundColor Red
     Write-Host "Add one under Settings > Projects root folders." -ForegroundColor Yellow
     Start-Sleep -Seconds 2
